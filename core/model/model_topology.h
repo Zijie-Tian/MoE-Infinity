@@ -11,6 +11,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #ifndef NVTX_DISABLE
@@ -57,6 +58,10 @@ struct Node {
 
   std::size_t id;
   std::size_t corr_id;
+
+  // Stable routed-expert identity, installed during dispatcher registration.
+  // Generic topology nodes leave this unset and use a disjoint tagged key.
+  std::optional<std::uint64_t> residency_key;
 
   torch::Device device = DISK_DEVICE;
   torch::Device default_device =

@@ -21,7 +21,8 @@ bool EventComplete(cudaEvent_t event) {
 ResidencyVariant CanonicalVariant(const NodePtr& node) {
   ResidencyVariant variant;
   if (node) {
-    variant.key.logical_expert_key = node->id;
+    variant.key.logical_expert_key =
+        node->residency_key.value_or(CanonicalNodeResidencyKey(node->id));
     variant.key.format = ExpertFormat::BF16;
     variant.key.generation = 0;
     variant.node = node;
@@ -138,8 +139,7 @@ std::uint32_t ExpertResidencyManager::NodeLeaseCount(
   return count;
 }
 
-NodePtr ExpertResidencyManager::SelectVictim(const GpuState& state,
-                                             std::int64_t needed_bytes) const {
+NodePtr ExpertResidencyManager::SelectVictim(const GpuState& state) const {
   NodePtr victim;
   std::size_t best_last_access = static_cast<std::size_t>(-1);
   for (const auto& entry : state.entries) {
@@ -150,7 +150,6 @@ NodePtr ExpertResidencyManager::SelectVictim(const GpuState& state,
                   entry.key) != protected_variants_.end()) {
       continue;
     }
-    if (entry.bytes < needed_bytes) continue;
     if (!victim || entry.node->last_access_time < best_last_access) {
       victim = entry.node;
       best_last_access = entry.node->last_access_time;
@@ -259,7 +258,7 @@ ResidencyTicket ExpertResidencyManager::BeginAdmission(
   const auto free_bytes = state.capacity_bytes - charged;
   ticket.id = next_ticket_id_++;
   if (requested > free_bytes) {
-    NodePtr victim = SelectVictim(state, requested - free_bytes);
+    NodePtr victim = SelectVictim(state);
     if (!victim) {
       if (mode == AdmissionMode::TRANSIENT_ON_PRESSURE) {
         ticket.outcome = AdmissionOutcome::TRANSIENT;
@@ -283,6 +282,7 @@ ResidencyTicket ExpertResidencyManager::BeginAdmission(
   if (!ticket.reserved_victim_key.has_value()) {
     state.transition_reserved_bytes += ticket.reserved_aligned_bytes;
     state.workspace_bytes += ticket.reserved_workspace_bytes;
+    ticket.reservation_charged = true;
   }
   pending_tickets_[ticket.id] = ticket;
   return ticket;
@@ -333,6 +333,7 @@ ResidencyTicket ExpertResidencyManager::BeginTransition(
   ++current_entry->lease_count;
   state.transition_reserved_bytes += ticket.reserved_aligned_bytes;
   state.workspace_bytes += ticket.reserved_workspace_bytes;
+  ticket.reservation_charged = true;
   pending_tickets_[ticket.id] = ticket;
   return ticket;
 }
@@ -346,20 +347,54 @@ bool ExpertResidencyManager::EvictReserved(const ResidencyTicket& ticket) {
   }
   ResidencyTicket& pending = pending_it->second;
   GpuState& state = StateFor(pending.gpu_id);
-  ResidencyEntry* victim = FindEntry(state, *pending.reserved_victim_key);
-  if (victim == nullptr || victim->lease_count != 1) return false;
-  if (transfer_ops_ && !transfer_ops_->MoveToHost(victim->node)) return false;
-  state.resident_bytes -= victim->bytes;
-  const auto key = victim->key;
-  state.entries.erase(std::remove_if(state.entries.begin(), state.entries.end(),
-                                     [&key](const ResidencyEntry& entry) {
-                                       return entry.key == key;
-                                     }),
-                      state.entries.end());
-  pending.reserved_victim = nullptr;
-  pending.reserved_victim_key.reset();
+  const auto requested = pending.reserved_aligned_bytes +
+                         pending.reserved_workspace_bytes;
+  auto charged = [&state]() {
+    return state.resident_bytes + state.transition_reserved_bytes +
+           state.workspace_bytes;
+  };
+
+  while (charged() + requested > state.capacity_bytes) {
+    if (!pending.reserved_victim_key.has_value()) {
+      NodePtr next = SelectVictim(state);
+      if (!next) return false;
+      ResidencyEntry* next_entry = FindEntry(state, next->id);
+      if (next_entry == nullptr) return false;
+      ++next_entry->lease_count;
+      pending.reserved_victim = next;
+      pending.reserved_victim_key = next_entry->key;
+    }
+
+    ResidencyEntry* victim = FindEntry(state, *pending.reserved_victim_key);
+    if (victim == nullptr || victim->lease_count != 1) return false;
+    if (transfer_ops_ && !transfer_ops_->MoveToHost(victim->node)) return false;
+    state.resident_bytes -= victim->bytes;
+    const auto key = victim->key;
+    state.entries.erase(
+        std::remove_if(state.entries.begin(), state.entries.end(),
+                       [&key](const ResidencyEntry& entry) {
+                         return entry.key == key;
+                       }),
+        state.entries.end());
+    pending.reserved_victim = nullptr;
+    pending.reserved_victim_key.reset();
+  }
+
+  // Capacity can become sufficient between BeginAdmission and this call when
+  // another pending transaction aborts. In that case the initially reserved
+  // victim was never consumed; release its reservation lease before charging
+  // the incoming transaction.
+  if (pending.reserved_victim_key.has_value()) {
+    if (auto* unused = FindEntry(state, *pending.reserved_victim_key)) {
+      if (unused->lease_count > 0) --unused->lease_count;
+    }
+    pending.reserved_victim = nullptr;
+    pending.reserved_victim_key.reset();
+  }
+
   state.transition_reserved_bytes += pending.reserved_aligned_bytes;
   state.workspace_bytes += pending.reserved_workspace_bytes;
+  pending.reservation_charged = true;
   return true;
 }
 
@@ -381,6 +416,10 @@ bool ExpertResidencyManager::CommitTransaction(
   if (pending.transient) {
     pending_tickets_.erase(pending_it);
     return true;
+  }
+  if (!pending.reservation_charged) {
+    pending_tickets_.erase(pending_it);
+    return false;
   }
 
   if (pending.kind == ResidencyTransactionKind::TRANSITION &&
@@ -425,9 +464,6 @@ bool ExpertResidencyManager::AbortTransaction(
   if (pending_it == pending_tickets_.end()) return false;
   ResidencyTicket pending = pending_it->second;
   GpuState& state = StateFor(pending.gpu_id);
-  const bool reservation_charged =
-      pending.kind == ResidencyTransactionKind::TRANSITION ||
-      !pending.reserved_victim_key.has_value();
   if (pending.reserved_victim_key.has_value()) {
     if (auto* victim = FindEntry(state, *pending.reserved_victim_key)) {
       if (victim->lease_count > 0) --victim->lease_count;
@@ -439,7 +475,7 @@ bool ExpertResidencyManager::AbortTransaction(
       if (replaced->lease_count > 0) --replaced->lease_count;
     }
   }
-  if (reservation_charged) {
+  if (pending.reservation_charged) {
     state.transition_reserved_bytes -= pending.reserved_aligned_bytes;
     state.workspace_bytes -= pending.reserved_workspace_bytes;
   }

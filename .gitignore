@@ -247,3 +247,6 @@ benchmarks/eval/__pycache__/
 
 # setuptools-scm generated version file (regenerated on every build)
 moe_infinity/_version.py
+findings.md
+progress.md
+task_plan.md

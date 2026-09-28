@@ -66,6 +66,10 @@ from transformers import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
 from moe_infinity.boundary import ArcherEngineHooks
+from moe_infinity.boundary.qwen2_moe import (
+    SyncQwen2MoeSparseMoeBlock,
+    ensure_qwen2_moe_registry,
+)
 from moe_infinity.boundary.transformers_model_overrides import (
     install_transformers_model_overrides,
     restore_context_transformers_model_overrides,
@@ -116,6 +120,33 @@ from moe_infinity.utils.async_transfer import (
     wait_transfer,
 )
 from moe_infinity.utils.device import get_default_device, get_device
+
+# Keep direct OffloadEngine users consistent with the public MoE entry point.
+ensure_qwen2_moe_registry()
+
+
+def _align_position_ids_to_reference_device(args, kwargs):
+    positions = kwargs.get("position_ids")
+    if not isinstance(positions, torch.Tensor):
+        return args, kwargs
+    reference = next(
+        (arg for arg in args if isinstance(arg, torch.Tensor)), None
+    )
+    if reference is None:
+        for name in ("hidden_states", "x", "inputs_embeds"):
+            value = kwargs.get(name)
+            if isinstance(value, torch.Tensor):
+                reference = value
+                break
+    if reference is None or positions.device == reference.device:
+        return args, kwargs
+    # HF generation can infer CPU from offloaded parameters even after the
+    # embedding hook produces GPU activations. RoPE needs matching devices.
+    aligned_kwargs = dict(kwargs)
+    aligned_kwargs["position_ids"] = positions.to(
+        reference.device, non_blocking=True
+    )
+    return args, aligned_kwargs
 
 
 @dataclass(frozen=True)
@@ -437,6 +468,38 @@ def _make_expert_tensor_map(name_id_map, config):
     return result
 
 
+def _mixtral_checkpoint_name(name, config):
+    """Map the Transformers v5 runtime ``mlp`` path to checkpoint naming."""
+    if getattr(config, "model_type", "") != "mixtral":
+        return name
+    return name.replace(".mlp.", ".block_sparse_moe.", 1)
+
+
+def _add_mixtral_runtime_name_aliases(name_id_map, model, config):
+    """Add runtime-name aliases without removing canonical checkpoint keys."""
+    if getattr(config, "model_type", "") != "mixtral":
+        return 0
+    runtime_names = [name for name, _ in model.named_parameters(recurse=True)]
+    runtime_names.extend(name for name, _ in model.named_buffers(recurse=True))
+    added = 0
+    for runtime_name in runtime_names:
+        canonical_name = _mixtral_checkpoint_name(runtime_name, config)
+        if canonical_name == runtime_name or canonical_name not in name_id_map:
+            continue
+        canonical_id = name_id_map[canonical_name]
+        existing_id = name_id_map.get(runtime_name)
+        if existing_id is not None and existing_id != canonical_id:
+            raise RuntimeError(
+                "Conflicting Mixtral runtime/checkpoint tensor IDs for "
+                f"{runtime_name}: runtime={existing_id}, "
+                f"checkpoint={canonical_id} ({canonical_name})"
+            )
+        if existing_id is None:
+            name_id_map[runtime_name] = canonical_id
+            added += 1
+    return added
+
+
 def _make_expert_nbytes_map(model, config):
     """Sum stored payload bytes per ``(layer_id, expert_id)`` from live params.
 
@@ -452,7 +515,8 @@ def _make_expert_nbytes_map(model, config):
         return {}
     result: dict[tuple[int, int], int] = {}
     for name, param in model.named_parameters(recurse=True):
-        layer_id, expert_id = parse_expert_id(name, config)
+        parse_name = _mixtral_checkpoint_name(name, config)
+        layer_id, expert_id = parse_expert_id(parse_name, config)
         if expert_id is None:
             continue
         nbytes = int(param.numel()) * int(param.element_size())
@@ -678,10 +742,13 @@ class OffloadEngine(object):
             return
         configure = getattr(self.archer_engine, "configure_phase_policy", None)
         if callable(configure):
+            # Match AdmissionMode in core/prefetch/expert_policy.h. The public
+            # config uses names, while the pybind boundary takes integer enums.
+            admission_modes = {"cache": 0, "transient_on_pressure": 1}
             configure(
                 phase_policy.enabled,
-                phase_policy.prefill_admission,
-                phase_policy.decode_admission,
+                admission_modes[phase_policy.prefill_admission],
+                admission_modes[phase_policy.decode_admission],
                 phase_policy.prefill_eviction_weight,
                 phase_policy.decode_eviction_weight,
                 phase_policy.starvation_limit,
@@ -1241,6 +1308,9 @@ class OffloadEngine(object):
                 base_model_prefix = model.base_model_prefix
 
                 model = self._apply_quantized_model_conversion(model)
+                _add_mixtral_runtime_name_aliases(
+                    self.name_id_map, model, self.config
+                )
 
                 self.expert_prefetcher = ExpertPrefetcher(self.config)
                 self.expert_prefetcher.set_archer_engine(self.archer_engine)
@@ -1307,7 +1377,11 @@ class OffloadEngine(object):
 
                 # for deepseek and glm, we need to set the expert_tensor_map for the model
                 first_k_dense_replace = 0
-                if "deepseek" in model_name or "glm" in model_name.lower():
+                # Local checkpoint paths commonly use mixed-case family names.
+                if (
+                    "deepseek" in model_name.lower()
+                    or "glm" in model_name.lower()
+                ):
                     first_k_dense_replace = moe_text_config(
                         self.config
                     ).first_k_dense_replace
@@ -1340,6 +1414,7 @@ class OffloadEngine(object):
                         or isinstance(module, SyncMixtralSparseMoeBlock)
                         or isinstance(module, SyncDeepseekV2MoEBlock)
                         or isinstance(module, SyncDeepseekV3MoEBlock)
+                        or isinstance(module, SyncQwen2MoeSparseMoeBlock)
                         or isinstance(module, Qwen3MoEBlock)
                         or isinstance(module, SyncDbrxFFNBlock)
                         or isinstance(module, SyncGptOssMLP)
@@ -2071,6 +2146,15 @@ class OffloadEngine(object):
         sparse_count = sum(
             1 for _, t in topo if isinstance(t, list) and len(t) > 1
         )
+        if getattr(self.config, "model_type", "") == "mixtral":
+            expected_sparse_count = int(self.config.num_hidden_layers)
+            if sparse_count != expected_sparse_count:
+                raise RuntimeError(
+                    "Incomplete Mixtral native topology: expected "
+                    f"{expected_sparse_count} sparse layers, got "
+                    f"{sparse_count}. Check runtime mlp/checkpoint "
+                    "block_sparse_moe name aliases."
+                )
         print(
             f"TOPO: {len(topo)} stages, {sparse_count} sparse",
             flush=True,
@@ -2124,7 +2208,10 @@ class OffloadEngine(object):
                 )
 
         expert_layer_id = 0
-        if "deepseek" in self.model_name or "glm" in self.model_name.lower():
+        if (
+            "deepseek" in self.model_name.lower()
+            or "glm" in self.model_name.lower()
+        ):
             expert_layer_id = moe_text_config(self.config).first_k_dense_replace
 
         output_device_index = None
@@ -2511,6 +2598,8 @@ class OffloadEngine(object):
                 and self._kv_cache_manager is not None
             ):
                 _ = self._reload_kv_cache(seq_id=self.request_id)
+
+            return _align_position_ids_to_reference_device(args, kwargs)
 
         @torch.no_grad()
         def _post_forward_module_hook(module, input, output):

@@ -71,27 +71,28 @@ def _find_cuda_home() -> str:
         torch.version.cuda if torch_available and torch.version.cuda else ""
     )
     cuda_major = cuda_version.split(".")[0] if cuda_version else ""
+    explicit_cuda_home = os.environ.get("CUDA_HOME")
     if cuda_major == "12":
         candidates = [
+            explicit_cuda_home,
             "/usr/local/cuda-12.6",
             "/usr/local/cuda-12.2",
-            os.environ.get("CUDA_HOME"),
             "/usr/local/cuda",
             "/usr/local/cuda-13.2",
             "/usr/local/cuda-13",
         ]
     elif cuda_major == "13":
         candidates = [
+            explicit_cuda_home,
             "/usr/local/cuda-13.2",
             "/usr/local/cuda-13",
-            os.environ.get("CUDA_HOME"),
             "/usr/local/cuda",
             "/usr/local/cuda-12.6",
             "/usr/local/cuda-12.2",
         ]
     else:
         candidates = [
-            os.environ.get("CUDA_HOME"),
+            explicit_cuda_home,
             "/usr/local/cuda",
             "/usr/local/cuda-13.2",
             "/usr/local/cuda-13",
@@ -346,7 +347,8 @@ if cuda_available:
     _cuda_arch_flags = ["-gencode=arch=compute_80,code=sm_80"]
     if os.environ.get("MOE_ENABLE_SM90", "1") == "1":
         _cuda_arch_flags.append("-gencode=arch=compute_90,code=sm_90")
-    if os.environ.get("MOE_ENABLE_SM120", "0") == "1":
+    _enable_sm120 = os.environ.get("MOE_ENABLE_SM120", "0") == "1"
+    if _enable_sm120:
         _cuda_arch_flags.append("-gencode=arch=compute_120,code=sm_120")
 
     # _store extension: IO and prefetch
@@ -403,34 +405,28 @@ if cuda_available:
         )
     )
 
-    _v4fp4_arch_flags = [
-        f
-        for f in _cuda_arch_flags
-        if "compute_80" not in f and "compute_90" not in f
-    ]
-    if not _v4fp4_arch_flags:
-        _v4fp4_arch_flags = ["-gencode=arch=compute_120a,code=sm_120a"]
-    else:
+    if _enable_sm120:
         _v4fp4_arch_flags = [
             f.replace("compute_120,code=sm_120", "compute_120a,code=sm_120a")
-            for f in _v4fp4_arch_flags
+            for f in _cuda_arch_flags
+            if "compute_120" in f
         ]
-    ext_modules.append(
-        cpp_extension.CUDAExtension(
-            name="moe_infinity._v4_fp4",
-            sources=[
-                "extensions/kernel/v4_fp4/v4_fp4_binding.cpp",
-                "extensions/kernel/v4_fp4/v4_fp4_dequant.cu",
-                "extensions/kernel/v4_fp4/mxfp4_dequant.cu",
-                "extensions/kernel/v4_fp4/fp8_dequant.cu",
-            ],
-            extra_compile_args={
-                "cxx": ["-O3", "-std=c++20", "-fPIC"],
-                "nvcc": ["-O3", "--use_fast_math", "-std=c++20"]
-                + _v4fp4_arch_flags,
-            },
+        ext_modules.append(
+            cpp_extension.CUDAExtension(
+                name="moe_infinity._v4_fp4",
+                sources=[
+                    "extensions/kernel/v4_fp4/v4_fp4_binding.cpp",
+                    "extensions/kernel/v4_fp4/v4_fp4_dequant.cu",
+                    "extensions/kernel/v4_fp4/mxfp4_dequant.cu",
+                    "extensions/kernel/v4_fp4/fp8_dequant.cu",
+                ],
+                extra_compile_args={
+                    "cxx": ["-O3", "-std=c++20", "-fPIC"],
+                    "nvcc": ["-O3", "--use_fast_math", "-std=c++20"]
+                    + _v4fp4_arch_flags,
+                },
+            )
         )
-    )
 
     ext_modules.append(
         cpp_extension.CUDAExtension(

@@ -6,7 +6,13 @@ from typing import Any, Dict, Optional, Union
 
 import torch
 
+from moe_infinity.boundary.qwen2_moe import ensure_qwen2_moe_registry
+
 warnings.filterwarnings("ignore")
+
+# Compatibility entry point: importing ``MoE`` installs the repository-local
+# Qwen2-MoE registry entry before any preflight inspects supported families.
+ensure_qwen2_moe_registry()
 
 
 def extract_context_feature(hidden_states, layer_ids=(1, 9, 17, 25, 33)):

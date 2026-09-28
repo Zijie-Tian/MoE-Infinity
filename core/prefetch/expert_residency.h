@@ -18,6 +18,21 @@
 #include "model/model_topology.h"
 #include "prefetch/expert_policy.h"
 
+// Routed experts and generic topology nodes share a uint64_t manager index.
+// Keep them in disjoint domains so dense node ids 0,1,... cannot alias
+// layer-0 experts 0,1,... . Supported routed layer ids keep the high bit clear.
+constexpr std::uint64_t kCanonicalNodeResidencyTag = UINT64_C(1) << 63;
+
+inline std::uint64_t RoutedExpertResidencyKey(int layer_idx, int expert_idx) {
+  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(layer_idx))
+          << 32) |
+         static_cast<std::uint32_t>(expert_idx);
+}
+
+inline std::uint64_t CanonicalNodeResidencyKey(std::size_t node_id) {
+  return kCanonicalNodeResidencyTag | static_cast<std::uint64_t>(node_id);
+}
+
 enum class AdmissionSource : std::uint8_t { DEMAND = 0, PREFETCH = 1 };
 
 enum class AdmissionOutcome : std::uint8_t {
@@ -107,6 +122,7 @@ struct ResidencyTicket {
   AdmissionOutcome outcome = AdmissionOutcome::REJECTED;
   std::int64_t reserved_aligned_bytes = 0;
   std::int64_t reserved_workspace_bytes = 0;
+  bool reservation_charged = false;
   bool transient = false;
   bool valid = false;
 };
@@ -213,7 +229,7 @@ class ExpertResidencyManager {
   const ResidencyEntry* FindEntry(const GpuState& state,
                                   const ResidencyVariantKey& key) const;
   ResidencyEntry* FindEntry(const ResidencyVariantKey& key, int* gpu_id);
-  NodePtr SelectVictim(const GpuState& state, std::int64_t needed_bytes) const;
+  NodePtr SelectVictim(const GpuState& state) const;
   std::uint32_t NodeLeaseCount(std::size_t node_id) const;
 
   mutable std::mutex mutex_;

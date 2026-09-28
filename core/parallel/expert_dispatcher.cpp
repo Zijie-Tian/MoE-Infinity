@@ -247,12 +247,6 @@ std::string FormatName(ExpertFormat format) {
   return "unknown";
 }
 
-std::uint64_t LogicalExpertKey(int layer_idx, int expert_idx) {
-  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(layer_idx))
-          << 32) |
-         static_cast<std::uint32_t>(expert_idx);
-}
-
 bool GenericFormatExecutionPair(ExpertFormat format, std::uint8_t execution) {
   return (format == ExpertFormat::BF16 && execution == 0) ||
          (format == ExpertFormat::FP8_E4M3_BLOCK128 && execution == 1) ||
@@ -452,8 +446,9 @@ bool ExpertDispatcher::RegisterExpertVariant(
   }
   if (!node || node->byte_size != aligned_bytes) return false;
 
-  ResidencyVariantKey key{LogicalExpertKey(layer_idx, expert_idx),
+  ResidencyVariantKey key{RoutedExpertResidencyKey(layer_idx, expert_idx),
                           *parsed_format, generation};
+  node->residency_key = key.logical_expert_key;
   ResidencyVariant variant{key, node, payload_bytes, aligned_bytes,
                            workspace_bytes};
   ExpertExecutionDescriptor descriptor{key, *parsed_execution, tensor_ids,
@@ -478,7 +473,8 @@ bool ExpertDispatcher::SetPrecisionTargets(
     const int expert_idx = std::get<1>(target);
     const auto format = ParseExpertFormat(std::get<2>(target));
     if (!format.has_value()) return false;
-    ResidencyVariantKey key{LogicalExpertKey(layer_idx, expert_idx), *format,
+    ResidencyVariantKey key{RoutedExpertResidencyKey(layer_idx, expert_idx),
+                            *format,
                             std::get<3>(target)};
     if (registered_variants_.count(key) == 0 ||
         validated.count(key.logical_expert_key) != 0) {
@@ -578,7 +574,8 @@ void ExpertDispatcher::InjectTransitionFailureOnceForTest(
   TORCH_CHECK(parsed_format.has_value(), "unknown expert format");
   std::lock_guard<std::mutex> lock(mutex_);
   fail_transition_once_ =
-      std::make_pair(LogicalExpertKey(layer_idx, expert_idx), *parsed_format);
+      std::make_pair(RoutedExpertResidencyKey(layer_idx, expert_idx),
+                     *parsed_format);
 }
 #endif
 
@@ -673,7 +670,7 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
     }
     if (manager_enabled_ && kExpertResidencyManager != nullptr) {
       auto active = kExpertResidencyManager->ActiveGeneration(
-          args.gpu_id, LogicalExpertKey(layer_idx, expert_idx));
+          args.gpu_id, RoutedExpertResidencyKey(layer_idx, expert_idx));
       if (active.has_value()) {
         exec_args.execution_key = *active;
         exec_args.execution_lease_id =
@@ -722,6 +719,8 @@ void ExpertDispatcher::RegisterExpert(
     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
     if (cached_node == nullptr) {
       cached_node = node;
+      cached_node->residency_key =
+          RoutedExpertResidencyKey(layer_idx, expert_idx);
       experts_[expert_idx][layer_idx]->node = node;
       // experts_[expert_idx][layer_idx]->jit_module =
       //     new torch::jit::script::Module(torch::jit::load(jit_path));
@@ -955,7 +954,8 @@ bool ExpertDispatcher::ApplyPrecisionTarget(const ExpertNodePtr& expert_node,
     return true;
   }
   const auto logical_key =
-      LogicalExpertKey(expert_node->layer_idx, expert_node->expert_idx);
+      RoutedExpertResidencyKey(expert_node->layer_idx,
+                               expert_node->expert_idx);
   ResidencyVariant destination;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1139,7 +1139,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
           exec_args.pending_counted_down = true;
           if (manager_enabled_ && kExpertResidencyManager != nullptr) {
             auto active = kExpertResidencyManager->ActiveGeneration(
-                gpu_id, LogicalExpertKey(layer_idx, expert_idx));
+                gpu_id, RoutedExpertResidencyKey(layer_idx, expert_idx));
             if (active.has_value()) {
               exec_args.execution_key = *active;
               exec_args.execution_lease_id =
@@ -1348,7 +1348,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
         exec_args.pending_counted_down = true;
         if (manager_enabled_ && kExpertResidencyManager != nullptr) {
           auto active = kExpertResidencyManager->ActiveGeneration(
-              gpu_id, LogicalExpertKey(layer_idx, expert_idx));
+              gpu_id, RoutedExpertResidencyKey(layer_idx, expert_idx));
           if (active.has_value()) {
             exec_args.execution_key = *active;
             exec_args.execution_lease_id = kDemandResidencyClient->AcquireLease(
@@ -1455,8 +1455,8 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
       std::optional<ExpertExecutionDescriptor> descriptor;
       if (manager_enabled_ && kExpertResidencyManager != nullptr) {
         auto active = kExpertResidencyManager->ActiveGeneration(
-            gpu_id, LogicalExpertKey(args.expert_node->layer_idx,
-                                     args.expert_node->expert_idx));
+            gpu_id, RoutedExpertResidencyKey(args.expert_node->layer_idx,
+                                             args.expert_node->expert_idx));
         if (active.has_value()) {
           std::lock_guard<std::mutex> lock(mutex_);
           const auto found = execution_descriptors_.find(*active);

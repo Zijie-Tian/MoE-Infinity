@@ -31,6 +31,11 @@ from moe_store.wrappers import (
     SyncQwen3_5MoeSparseMoeBlock,
 )
 
+from moe_infinity.boundary.qwen2_moe import (
+    SyncQwen2MoeRotaryEmbedding,
+    SyncQwen2MoeSparseMoeBlock,
+)
+
 try:
     from moe_store.wrappers import OlmoePagedAttention
 except ImportError:
@@ -51,6 +56,12 @@ def install_transformers_model_overrides() -> None:
     mixtral = _model_module("mixtral")
     mixtral._old_sparse_mlp = mixtral.MixtralSparseMoeBlock
     mixtral.MixtralSparseMoeBlock = SyncMixtralSparseMoeBlock
+
+    qwen2 = _model_module("qwen2_moe")
+    qwen2._old_qwen2_sparse_mlp = qwen2.Qwen2MoeSparseMoeBlock
+    qwen2.Qwen2MoeSparseMoeBlock = SyncQwen2MoeSparseMoeBlock
+    qwen2._old_qwen2_rotary_embedding = qwen2.Qwen2MoeRotaryEmbedding
+    qwen2.Qwen2MoeRotaryEmbedding = SyncQwen2MoeRotaryEmbedding
 
     qwen3 = _model_module("qwen3_moe")
     qwen3._old_sparse_mlp = qwen3.Qwen3MoeSparseMoeBlock
@@ -165,6 +176,14 @@ def restore_runtime_transformers_model_overrides() -> None:
 
     mixtral = _model_module("mixtral")
     mixtral.MixtralSparseMoeBlock = mixtral._old_sparse_mlp
+
+    qwen2 = _model_module("qwen2_moe")
+    if hasattr(qwen2, "_old_qwen2_sparse_mlp"):
+        qwen2.Qwen2MoeSparseMoeBlock = qwen2._old_qwen2_sparse_mlp
+    if hasattr(qwen2, "_old_qwen2_rotary_embedding"):
+        qwen2.Qwen2MoeRotaryEmbedding = (
+            qwen2._old_qwen2_rotary_embedding
+        )
 
     qwen3 = _model_module("qwen3_moe")
     qwen3.Qwen3MoeSparseMoeBlock = qwen3._old_sparse_mlp
