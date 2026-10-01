@@ -115,10 +115,63 @@ def test_phase_policy_defaults_are_backward_compatible(monkeypatch):
     monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
     config = ArcherConfig(offload_path="/tmp", use_native_engine=False)
     assert config.phase_specific_expert_policy is False
+    assert config.expert_cache_policy == "lru"
     assert config.prefill_expert_admission == "transient_on_pressure"
     assert config.decode_expert_admission == "cache"
     assert config.prefill_expert_prefetch_top_k == 0
     assert config.decode_expert_prefetch_top_k == 2
+
+
+@pytest.mark.parametrize("policy", ["lru", "lfu"])
+def test_managed_expert_cache_policies_are_accepted(monkeypatch, policy):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    config = ArcherConfig.load_from_json(
+        {
+            "offload_path": "/tmp",
+            "use_native_engine": False,
+            "phase_specific_expert_policy": True,
+            "expert_cache_policy": policy,
+        }
+    )
+    assert config.expert_cache_policy == policy
+
+
+@pytest.mark.parametrize("policy", ["LRU", "fifo", ""])
+def test_invalid_expert_cache_policy_is_rejected(monkeypatch, policy):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    with pytest.raises(ValueError, match="expert_cache_policy must be one of"):
+        ArcherConfig(
+            offload_path="/tmp",
+            use_native_engine=False,
+            phase_specific_expert_policy=True,
+            expert_cache_policy=policy,
+        )
+
+
+def test_lfu_requires_phase_specific_policy(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    with pytest.raises(
+        ValueError, match="requires phase_specific_expert_policy=True"
+    ):
+        ArcherConfig(
+            offload_path="/tmp",
+            use_native_engine=False,
+            expert_cache_policy="lfu",
+        )
+
+
+def test_adaptive_precision_alone_does_not_enable_lfu(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    with pytest.raises(
+        ValueError, match="requires phase_specific_expert_policy=True"
+    ):
+        ArcherConfig(
+            offload_path="/tmp",
+            use_native_engine=False,
+            adaptive_expert_precision=True,
+            adaptive_hbm_budget_bytes=1,
+            expert_cache_policy="lfu",
+        )
 
 
 @pytest.mark.parametrize(

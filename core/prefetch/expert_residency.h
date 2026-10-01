@@ -5,14 +5,17 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "model/model_topology.h"
@@ -135,6 +138,23 @@ struct ResidencyEntry {
   ResidencyState state = ResidencyState::HOST_READY;
   std::uint32_t lease_count = 0;
   cudaEvent_t last_use_event = nullptr;
+  // Demand-only LFU state for the current residency epoch.  Prefetch does not
+  // touch these fields; an unconsumed prefetched entry therefore has frequency
+  // zero.  A true eviction removes the entry and resets its history.
+  std::uint64_t demand_frequency = 0;
+  std::uint64_t last_demand_sequence = 0;
+  bool prefetched_unconsumed = false;
+  std::uint64_t residency_epoch = 0;
+};
+
+struct ExpertResidencyEvent {
+  std::uint64_t sequence = 0;
+  std::int64_t timestamp_ns = 0;
+  std::uint64_t logical_expert_key = 0;
+  std::uint64_t residency_epoch = 0;
+  int gpu_id = -1;
+  std::int64_t bytes = 0;
+  std::string kind;
 };
 
 struct LeaseRecord {
@@ -198,7 +218,17 @@ class ExpertResidencyManager {
       const std::vector<ResidencyVariantKey>& candidates);
 
   void ReplaceProtectedCandidates(const NodePtrList& candidates);
-  void RecordAccess(const NodePtr& node, ExpertPhase phase, bool hit);
+  void RecordAccess(const NodePtr& node, ExpertPhase phase, bool hit,
+                    bool waited_for_prefetch = false,
+                    std::int64_t arrival_ns = 0);
+  void RecordDemandH2D(const NodePtr& node, std::int64_t bytes);
+  void RecordPrefetchH2D(const NodePtr& node, std::int64_t bytes);
+  void RecordPrefetchReleaseBegin(const NodePtr& node);
+  void RecordPrefetchReleaseReady(const NodePtr& node);
+  std::vector<ExpertResidencyEvent> DrainEvents();
+
+  bool ConfigureEvictionPolicy(ExpertEvictionPolicy policy);
+  ExpertEvictionPolicy EvictionPolicy() const;
 
   void ConfigurePolicy(const PhasePolicyConfig& config);
   bool PolicyEnabled() const;
@@ -229,8 +259,12 @@ class ExpertResidencyManager {
   const ResidencyEntry* FindEntry(const GpuState& state,
                                   const ResidencyVariantKey& key) const;
   ResidencyEntry* FindEntry(const ResidencyVariantKey& key, int* gpu_id);
+  ResidencyEntry* FindActiveLogicalEntry(int gpu_id, std::uint64_t logical_key);
   NodePtr SelectVictim(const GpuState& state) const;
   std::uint32_t NodeLeaseCount(std::size_t node_id) const;
+  void AppendEventLocked(const ResidencyEntry& entry, int gpu_id,
+                         const std::string& kind,
+                         std::int64_t timestamp_ns = 0);
 
   mutable std::mutex mutex_;
   std::shared_ptr<ResidencyTransferOps> transfer_ops_;
@@ -239,6 +273,7 @@ class ExpertResidencyManager {
   std::unordered_map<std::uint64_t, LeaseRecord> leases_;
   std::vector<ResidencyVariant> registered_variants_;
   std::unordered_map<std::uint64_t, WorkspaceRecord> workspace_records_;
+  // Phase-policy metadata is retained independently of cache-local LFU state.
   std::unordered_map<std::size_t, ExpertPolicyMetadata> access_metadata_;
   std::unordered_set<std::size_t> protected_ids_;
   std::vector<ResidencyVariantKey> protected_variants_;
@@ -248,7 +283,104 @@ class ExpertResidencyManager {
   std::uint64_t next_ticket_id_ = 1;
   std::uint64_t next_lease_id_ = 1;
   std::uint64_t access_sequence_ = 0;
+  std::uint64_t demand_access_sequence_ = 0;
+  std::uint64_t routed_demand_accesses_ = 0;
+  std::uint64_t generic_demand_accesses_ = 0;
+  std::uint64_t demand_h2d_count_ = 0;
+  std::uint64_t demand_h2d_bytes_ = 0;
+  std::uint64_t prefetch_h2d_count_ = 0;
+  std::uint64_t prefetch_h2d_bytes_ = 0;
+  std::uint64_t demand_miss_count_ = 0;
+  std::uint64_t demand_miss_bytes_ = 0;
+  std::uint64_t prefetch_ready_first_use_count_ = 0;
+  std::uint64_t prefetch_ready_first_use_bytes_ = 0;
+  std::uint64_t prefetch_late_first_use_count_ = 0;
+  std::uint64_t prefetch_late_first_use_bytes_ = 0;
+  std::uint64_t reuse_hit_count_ = 0;
+  std::uint64_t reuse_hit_bytes_ = 0;
+  std::uint64_t unused_prefetch_eviction_count_ = 0;
+  std::uint64_t unused_prefetch_eviction_bytes_ = 0;
+  std::vector<ExpertResidencyEvent> residency_events_;
+  std::uint64_t residency_events_dropped_ = 0;
+  std::uint64_t next_residency_event_sequence_ = 1;
+  std::uint64_t next_residency_epoch_ = 1;
+  ExpertEvictionPolicy eviction_policy_ = ExpertEvictionPolicy::LRU;
 };
+
+namespace expert_residency_detail {
+
+inline bool HasActiveCanonicalVariant(
+    const std::shared_ptr<ExpertResidencyManager>& manager, int gpu_id,
+    const NodePtr& node) {
+  if (!manager || !node || !node->residency_key.has_value()) return false;
+  const ResidencyVariantKey expected{*node->residency_key, ExpertFormat::BF16,
+                                     0};
+  const auto active = manager->ActiveGeneration(gpu_id, *node->residency_key);
+  return active.has_value() && *active == expected;
+}
+
+// Claim a node for demand execution while treating a manager eviction claim as
+// a short reservation, not a fatal competing executor. Other busy states are
+// returned to the caller unchanged so existing prefetch/fatal behavior remains
+// under dispatcher control.
+inline bool ClaimNodeForDemandExecution(const NodePtr& node,
+                                        NodeExecState* competing_state) {
+  if (!node) return false;
+  while (true) {
+    auto expected = NodeExecState::IDLE;
+    if (node->exec_state.compare_exchange_strong(
+            expected, NodeExecState::FETCHING, std::memory_order_acq_rel)) {
+      if (competing_state != nullptr) *competing_state = NodeExecState::IDLE;
+      return true;
+    }
+    if (expected == NodeExecState::RESIZE_RESERVED) {
+      std::this_thread::sleep_for(std::chrono::microseconds(10));
+      continue;
+    }
+    if (competing_state != nullptr) *competing_state = expected;
+    return false;
+  }
+}
+
+// Own one pending manager admission until commit succeeds or the scope exits.
+// The guard is also used by unit tests so failure cleanup is exercised through
+// the same implementation as the production fetch worker.
+class PendingAdmissionGuard {
+ public:
+  explicit PendingAdmissionGuard(
+      std::shared_ptr<ExpertResidencyManager> manager)
+      : manager_(std::move(manager)) {}
+
+  void Arm(const ResidencyTicket* ticket) {
+    ticket_ = ticket;
+    armed_ = ticket_ != nullptr && ticket_->valid && ticket_->id != 0;
+  }
+
+  void Abort() noexcept {
+    if (!armed_) return;
+    try {
+      manager_->AbortAdmission(*ticket_);
+    } catch (...) {
+      // Preserve the original fetch/transfer failure.
+    }
+    armed_ = false;
+    ticket_ = nullptr;
+  }
+
+  void Disarm() noexcept {
+    armed_ = false;
+    ticket_ = nullptr;
+  }
+
+  ~PendingAdmissionGuard() { Abort(); }
+
+ private:
+  std::shared_ptr<ExpertResidencyManager> manager_;
+  const ResidencyTicket* ticket_ = nullptr;
+  bool armed_ = false;
+};
+
+}  // namespace expert_residency_detail
 
 class ExpertResidencyClient {
  public:

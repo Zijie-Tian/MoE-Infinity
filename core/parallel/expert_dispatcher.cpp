@@ -618,28 +618,30 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
   int layer_idx = args.layer_idx;
   int expert_idx = args.expert_idx;
   auto expert_node = experts_[expert_idx][layer_idx];
+  args.demand_arrival_ns = SteadyNowNs();
+  args.resident_at_arrival = expert_node->node->device.is_cuda();
+  args.prefetch_in_progress_at_arrival =
+      expert_node->node->is_prefetching.load(std::memory_order_acquire);
   if (manager_enabled_ && !ApplyPrecisionTarget(expert_node, args.gpu_id)) {
     DLOG_WARN("adaptive precision target failed; using current generation");
   }
 
-  {
-    auto expected = NodeExecState::IDLE;
-    if (!expert_node->node->exec_state.compare_exchange_strong(
-            expected, NodeExecState::FETCHING, std::memory_order_acq_rel)) {
-      if (expert_node->node->is_prefetching.load(std::memory_order_acquire)) {
-        expert_node->node->pending_dispatches.fetch_add(
-            1, std::memory_order_acq_rel);
-        args.wait_for_prefetch = true;
-        args.gpu_id = expert_node->node->default_device.index();
-        AdmitAndCount(args.gpu_id);
-        input_queue_[args.gpu_id].Push(args);
-        return;
-      }
-      DLOG_FATAL(
-          "ExpertDispatcher::Enqueue: exec_state CAS failed (expert_idx ",
-          expert_idx, " layer_idx ", layer_idx, " node ",
-          expert_node->node->str(), " state=", static_cast<int>(expected), ")");
+  NodeExecState competing_state = NodeExecState::IDLE;
+  if (!expert_residency_detail::ClaimNodeForDemandExecution(expert_node->node,
+                                                            &competing_state)) {
+    if (expert_node->node->is_prefetching.load(std::memory_order_acquire)) {
+      expert_node->node->pending_dispatches.fetch_add(
+          1, std::memory_order_acq_rel);
+      args.wait_for_prefetch = true;
+      args.gpu_id = expert_node->node->default_device.index();
+      AdmitAndCount(args.gpu_id);
+      input_queue_[args.gpu_id].Push(args);
+      return;
     }
+    DLOG_FATAL("ExpertDispatcher::Enqueue: exec_state CAS failed (expert_idx ",
+               expert_idx, " layer_idx ", layer_idx, " node ",
+               expert_node->node->str(),
+               " state=", static_cast<int>(competing_state), ")");
   }
   expert_node->node->last_access_time = MCIROSECONDS_SINCE_EPOCH;
 
@@ -663,8 +665,9 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
     exec_args.invocation_id = args.invocation_id;
     exec_args.generation = args.generation;
     if (kExpertResidencyManager && kExpertResidencyManager->PolicyEnabled()) {
-      kExpertResidencyManager->RecordAccess(expert_node->node, args.phase,
-                                            true);
+      kExpertResidencyManager->RecordAccess(
+          expert_node->node, args.phase, args.resident_at_arrival,
+          args.prefetch_in_progress_at_arrival, args.demand_arrival_ns);
       exec_args.residency_lease = kExpertResidencyManager->AcquireLease(
           expert_node->node, LeaseKind::DEMAND);
     }
@@ -953,9 +956,11 @@ bool ExpertDispatcher::ApplyPrecisionTarget(const ExpertNodePtr& expert_node,
       kDemandResidencyClient == nullptr) {
     return true;
   }
+  if (expert_node->node->is_prefetching.load(std::memory_order_acquire)) {
+    return false;
+  }
   const auto logical_key =
-      RoutedExpertResidencyKey(expert_node->layer_idx,
-                               expert_node->expert_idx);
+      RoutedExpertResidencyKey(expert_node->layer_idx, expert_node->expert_idx);
   ResidencyVariant destination;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -987,9 +992,11 @@ bool ExpertDispatcher::ApplyPrecisionTarget(const ExpertNodePtr& expert_node,
           : kDemandResidencyClient->BeginAdmission(
                 destination, gpu_id, ExpertPhase::MIXED, AdmissionMode::CACHE);
   if (!transaction.valid) return false;
+  expert_residency_detail::PendingAdmissionGuard transaction_guard(
+      kExpertResidencyManager);
+  transaction_guard.Arm(&transaction);
   if (transaction.reserved_victim_key.has_value() &&
       !kExpertResidencyManager->EvictReserved(transaction)) {
-    kExpertResidencyManager->AbortTransaction(transaction);
     return false;
   }
 
@@ -1002,11 +1009,13 @@ bool ExpertDispatcher::ApplyPrecisionTarget(const ExpertNodePtr& expert_node,
       kCudaEventPool->Release(transfer_done);
     }
   } catch (const std::exception&) {
-    kExpertResidencyManager->AbortTransaction(transaction);
     ++transition_failed_count_;
     return false;
   }
   if (!kExpertResidencyManager->CommitTransaction(transaction)) return false;
+  transaction_guard.Disarm();
+  kExpertResidencyManager->RecordDemandH2D(destination.node,
+                                           destination.aligned_bytes);
   h2d_payload_bytes_ += destination.payload_bytes;
   ++h2d_transfers_;
   if (active.has_value()) {
@@ -1127,8 +1136,10 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
           exec_args.generation = args.generation;
           if (kExpertResidencyManager &&
               kExpertResidencyManager->PolicyEnabled()) {
-            kExpertResidencyManager->RecordAccess(expert_node->node, args.phase,
-                                                  true);
+            kExpertResidencyManager->RecordAccess(
+                expert_node->node, args.phase, args.resident_at_arrival,
+                args.wait_for_prefetch || args.prefetch_in_progress_at_arrival,
+                args.demand_arrival_ns);
             exec_args.residency_lease = kExpertResidencyManager->AcquireLease(
                 expert_node->node, LeaseKind::DEMAND);
           }
@@ -1156,6 +1167,8 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
       const bool managed =
           kExpertResidencyManager && kExpertResidencyManager->PolicyEnabled();
       ResidencyTicket residency_ticket;
+      expert_residency_detail::PendingAdmissionGuard admission_guard(
+          kExpertResidencyManager);
 
       if (managed && !cache_hit) {
         TORCH_CHECK(kExpertResidencyManager->IsCapacityConfigured(gpu_id),
@@ -1166,14 +1179,20 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
               expert_node->node, gpu_id, args.phase,
               kExpertResidencyManager->AdmissionFor(args.phase),
               AdmissionSource::DEMAND);
-          if (residency_ticket.valid) break;
-          std::this_thread::sleep_for(std::chrono::microseconds(10));
+          if (!residency_ticket.valid) {
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+            continue;
+          }
+          admission_guard.Arm(&residency_ticket);
+          if (residency_ticket.reserved_victim != nullptr &&
+              !kExpertResidencyManager->EvictReserved(residency_ticket)) {
+            admission_guard.Abort();
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+            continue;
+          }
+          break;
         }
         if (main_thread_stop_flag_.load(std::memory_order_acquire)) break;
-        if (residency_ticket.reserved_victim != nullptr) {
-          TORCH_CHECK(kExpertResidencyManager->EvictReserved(residency_ticket),
-                      "failed to evict reserved expert victim");
-        }
         expert_node->node->is_overflow = residency_ticket.transient;
       }
 
@@ -1302,6 +1321,10 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
 
       cudaEvent_t transfer_done = nullptr;
       expert_node->node->SetDevice(device, true, stream, &transfer_done);
+      if (managed && !cache_hit) {
+        kExpertResidencyManager->RecordDemandH2D(expert_node->node,
+                                                 expert_node->node->byte_size);
+      }
       expert_node->node->incache_visit_count += 1;
       expert_node->SetTensorsFromBlob(device);
       // module_->SetTensorsFromIds(expert_node->node->tensor_ids);
@@ -1329,9 +1352,11 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
             TORCH_CHECK(
                 kExpertResidencyManager->CommitAdmission(residency_ticket),
                 "failed to commit expert admission");
+            admission_guard.Disarm();
           }
-          kExpertResidencyManager->RecordAccess(expert_node->node, args.phase,
-                                                cache_hit);
+          kExpertResidencyManager->RecordAccess(
+              expert_node->node, args.phase, args.resident_at_arrival,
+              args.prefetch_in_progress_at_arrival, args.demand_arrival_ns);
           exec_args.residency_lease = kExpertResidencyManager->AcquireLease(
               expert_node->node, LeaseKind::DEMAND);
           exec_args.managed_transient = residency_ticket.transient;

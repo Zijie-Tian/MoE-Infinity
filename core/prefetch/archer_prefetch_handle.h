@@ -35,7 +35,9 @@ class ArcherPrefetchHandle {
   void EnqueuePrefetch(const uint32_t tensor_id, int gpu_id);
   void EnqueuePrefetchTensors(const std::vector<std::uint32_t>& tensor_ids,
                               std::uint32_t priority = kRouteAheadPriority,
-                              int phase = static_cast<int>(ExpertPhase::MIXED));
+                              int phase = static_cast<int>(ExpertPhase::MIXED),
+                              std::uint64_t generation = 0,
+                              std::int64_t layer_id = -1);
 
   PrefetchAdmission SchedulePrefetchTensors(
       const std::vector<std::uint32_t>& tensor_ids, std::uint32_t priority,
@@ -46,6 +48,7 @@ class ArcherPrefetchHandle {
       const std::vector<std::uint32_t>& keep_tensor_ids);
   std::vector<PrefetchSample> DrainPrefetchSamples();
   std::int64_t GetInflightPrefetchBytes();
+  ExpertPolicyStats GetPrefetchPipelineStats();
 
   void OffloadTensor(torch::Tensor& tensor, const std::uint32_t tensor_id);
   void RegisterTensor(torch::Tensor& tensor, const std::uint32_t tensor_id);
@@ -109,7 +112,10 @@ class ArcherPrefetchHandle {
   void ConfigureExpertPolicy(bool enabled, int prefill_admission,
                              int decode_admission, double prefill_weight,
                              double decode_weight, int starvation_limit);
+  void ConfigureExpertCachePolicy(int policy);
+  int GetExpertCachePolicy() const;
   ExpertPolicyStats GetExpertPolicyStats() const;
+  std::vector<ExpertResidencyEvent> DrainExpertResidencyEvents();
 
   // void SetNodeCachePriority(const std::uint64_t corr_id, const float
   // priority);

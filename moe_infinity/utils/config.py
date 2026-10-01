@@ -130,6 +130,12 @@ class ArcherConfig:
             "help": "Master gate for phase-specific expert admission, prefetch, and eviction policy (PR #179 substrate). Default False keeps legacy behavior. Adaptive precision does not require this to be True; when False the adaptive path still uses ExpertResidencyManager with neutral, legacy-equivalent phase utility."
         },
     )
+    expert_cache_policy: str = field(
+        default="lru",
+        metadata={
+            "help": "Managed expert cache eviction policy: lru or lfu. LFU requires phase_specific_expert_policy=True."
+        },
+    )
     adaptive_expert_precision: bool = field(
         default=False,
         metadata={
@@ -432,6 +438,21 @@ class ArcherConfig:
         if not 0.0 <= self.adaptive_memory_hysteresis_ratio <= 1.0:
             raise ValueError(
                 "adaptive_memory_hysteresis_ratio must be in [0, 1]"
+            )
+
+        valid_cache_policies = ("lru", "lfu")
+        if self.expert_cache_policy not in valid_cache_policies:
+            raise ValueError(
+                "expert_cache_policy must be one of "
+                f"{valid_cache_policies}, got {self.expert_cache_policy!r}"
+            )
+        if (
+            self.expert_cache_policy == "lfu"
+            and not self.phase_specific_expert_policy
+        ):
+            raise ValueError(
+                "expert_cache_policy='lfu' requires "
+                "phase_specific_expert_policy=True"
             )
 
         if self.adaptive_expert_precision:

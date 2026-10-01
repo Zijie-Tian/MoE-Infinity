@@ -25,14 +25,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readonly("inflight_bytes", &PrefetchAdmission::inflight_bytes);
 
   py::class_<PrefetchSample>(m, "prefetch_sample")
+      .def_readonly("issue_id", &PrefetchSample::issue_id)
       .def_readonly("generation", &PrefetchSample::generation)
       .def_readonly("layer_id", &PrefetchSample::layer_id)
       .def_readonly("tensor_id", &PrefetchSample::tensor_id)
       .def_readonly("bytes", &PrefetchSample::bytes)
+      .def_readonly("h2d_bytes", &PrefetchSample::h2d_bytes)
       .def_readonly("queue_wait_ns", &PrefetchSample::queue_wait_ns)
       .def_readonly("transfer_ns", &PrefetchSample::transfer_ns)
+      .def_readonly("enqueue_ns", &PrefetchSample::enqueue_ns)
+      .def_readonly("start_ns", &PrefetchSample::start_ns)
+      .def_readonly("complete_ns", &PrefetchSample::complete_ns)
       .def_readonly("source_device", &PrefetchSample::source_device)
       .def_readonly("outcome", &PrefetchSample::outcome);
+
+  py::class_<ExpertResidencyEvent>(m, "expert_residency_event")
+      .def_readonly("sequence", &ExpertResidencyEvent::sequence)
+      .def_readonly("timestamp_ns", &ExpertResidencyEvent::timestamp_ns)
+      .def_readonly("logical_expert_key",
+                    &ExpertResidencyEvent::logical_expert_key)
+      .def_readonly("residency_epoch", &ExpertResidencyEvent::residency_epoch)
+      .def_readonly("gpu_id", &ExpertResidencyEvent::gpu_id)
+      .def_readonly("bytes", &ExpertResidencyEvent::bytes)
+      .def_readonly("kind", &ExpertResidencyEvent::kind);
 
   py::class_<ArcherPrefetchHandle> prefetch_handle_cls(m, "prefetch_handle");
   BindTensorStoreSurface(prefetch_handle_cls);
@@ -87,6 +102,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_topology_snapshot", &ArcherPrefetchHandle::GetTopologySnapshot)
       .def("get_expert_policy_stats",
            &ArcherPrefetchHandle::GetExpertPolicyStats)
+      .def("drain_expert_residency_events",
+           &ArcherPrefetchHandle::DrainExpertResidencyEvents)
       .def("get_policy_stats", &ArcherPrefetchHandle::GetExpertPolicyStats)
       .def("get_residency_manager_id",
            &ArcherPrefetchHandle::GetResidencyManagerId)
@@ -109,7 +126,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_node_device", &ArcherPrefetchHandle::GetNodeDevice)
       .def("prefetch_tensors", &ArcherPrefetchHandle::EnqueuePrefetchTensors,
            py::arg("tensor_ids"), py::arg("priority") = kRouteAheadPriority,
-           py::arg("phase") = static_cast<int>(ExpertPhase::MIXED))
+           py::arg("phase") = static_cast<int>(ExpertPhase::MIXED),
+           py::arg("generation") = 0, py::arg("layer_id") = -1)
       .def("schedule_prefetch_tensors",
            &ArcherPrefetchHandle::SchedulePrefetchTensors,
            py::arg("tensor_ids"), py::arg("priority"), py::arg("generation"),
@@ -122,6 +140,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &ArcherPrefetchHandle::DrainPrefetchSamples)
       .def("get_inflight_prefetch_bytes",
            &ArcherPrefetchHandle::GetInflightPrefetchBytes)
+      .def("get_prefetch_pipeline_stats",
+           &ArcherPrefetchHandle::GetPrefetchPipelineStats)
       .def("replace_cache_candidates",
            &ArcherPrefetchHandle::ReplaceCacheCandidates)
       .def("enqueue_prefetch", &ArcherPrefetchHandle::EnqueuePrefetch)
@@ -140,6 +160,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("prefill_admission"), py::arg("decode_admission"),
            py::arg("prefill_weight"), py::arg("decode_weight"),
            py::arg("starvation_limit"))
+      .def("configure_expert_cache_policy",
+           &ArcherPrefetchHandle::ConfigureExpertCachePolicy, py::arg("policy"))
+      .def("get_expert_cache_policy",
+           &ArcherPrefetchHandle::GetExpertCachePolicy)
       .def("get_expert_policy_stats",
            &ArcherPrefetchHandle::GetExpertPolicyStats)
       .def("reset_cache", &ArcherPrefetchHandle::ResetCache);
@@ -179,7 +203,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("enqueue_expert", &ExpertDispatcher::EnqueueExpert,
            py::arg("layer_idx"), py::arg("expert_idx"), py::arg("gpu_id") = -1,
            py::arg("remote") = false,
-           py::arg("phase") = static_cast<int>(ExpertPhase::MIXED))
+           py::arg("phase") = static_cast<int>(ExpertPhase::MIXED),
+           py::call_guard<py::gil_scoped_release>())
       .def("set_inputs", &ExpertDispatcher::SetInputs)
       .def("set_inputs_with_invocation",
            &ExpertDispatcher::SetInputsWithInvocation)
@@ -253,23 +278,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                aggregate["resident_bytes"] = 0;
                by_format[format] = aggregate;
              }
-             for (const auto& row : dispatcher.GetResidentGenerationEntries()) {
-               const auto format_index = std::get<1>(row);
-               py::dict item;
-               item["logical_expert_key"] = std::get<0>(row);
-               item["format"] = formats[format_index];
-               item["generation"] = std::get<2>(row);
-               item["payload_bytes"] = std::get<3>(row);
-               item["aligned_bytes"] = std::get<4>(row);
-               item["state"] = std::get<5>(row) == 1 ? "active" : "retiring";
-               entries.append(item);
-               auto aggregate =
-                   by_format[formats[format_index]].cast<py::dict>();
-               aggregate["resident_generations"] =
-                   aggregate["resident_generations"].cast<std::int64_t>() + 1;
-               aggregate["resident_bytes"] =
-                   aggregate["resident_bytes"].cast<std::int64_t>() +
-                   std::get<4>(row);
+             if (kExpertResidencyManager != nullptr) {
+               for (int gpu_id = 0; gpu_id < std::max(kNumDevices(), 1);
+                    ++gpu_id) {
+                 for (const auto& entry :
+                      kExpertResidencyManager->ResidentGenerations(gpu_id)) {
+                   const auto format_index =
+                       static_cast<std::uint8_t>(entry.key.format);
+                   py::dict item;
+                   item["gpu_id"] = gpu_id;
+                   item["logical_expert_key"] = entry.key.logical_expert_key;
+                   item["format"] = formats[format_index];
+                   item["generation"] = entry.key.generation;
+                   item["payload_bytes"] = entry.payload_bytes;
+                   item["aligned_bytes"] = entry.bytes;
+                   item["state"] = entry.state == ResidencyState::ACTIVE
+                                       ? "active"
+                                       : "retiring";
+                   item["frequency"] = entry.demand_frequency;
+                   item["last_touch_sequence"] = entry.last_demand_sequence;
+                   entries.append(item);
+                   auto aggregate =
+                       by_format[formats[format_index]].cast<py::dict>();
+                   aggregate["resident_generations"] =
+                       aggregate["resident_generations"].cast<std::int64_t>() +
+                       1;
+                   aggregate["resident_bytes"] =
+                       aggregate["resident_bytes"].cast<std::int64_t>() +
+                       entry.bytes;
+                 }
+               }
              }
              result["resident_generation_entries"] = entries;
              result["by_format"] = by_format;

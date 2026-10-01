@@ -6,6 +6,7 @@
 #include "prefetch/expert_residency.h"
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <stdexcept>
 
@@ -16,6 +17,12 @@ namespace {
 bool EventComplete(cudaEvent_t event) {
   if (event == nullptr) return true;
   return cudaEventQuery(event) == cudaSuccess;
+}
+
+std::int64_t ResidencySteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
 }
 
 ResidencyVariant CanonicalVariant(const NodePtr& node) {
@@ -130,6 +137,19 @@ ResidencyEntry* ExpertResidencyManager::FindEntry(
   return nullptr;
 }
 
+ResidencyEntry* ExpertResidencyManager::FindActiveLogicalEntry(
+    int gpu_id, std::uint64_t logical_key) {
+  auto state = gpu_states_.find(gpu_id);
+  if (state == gpu_states_.end()) return nullptr;
+  for (auto& entry : state->second.entries) {
+    if (entry.state == ResidencyState::ACTIVE &&
+        entry.key.logical_expert_key == logical_key) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
 std::uint32_t ExpertResidencyManager::NodeLeaseCount(
     std::size_t node_id) const {
   std::uint32_t count = 0;
@@ -139,20 +159,70 @@ std::uint32_t ExpertResidencyManager::NodeLeaseCount(
   return count;
 }
 
+void ExpertResidencyManager::AppendEventLocked(const ResidencyEntry& entry,
+                                               int gpu_id,
+                                               const std::string& kind,
+                                               std::int64_t timestamp_ns) {
+  constexpr std::size_t kMaxBufferedResidencyEvents = 1U << 20;
+  if (residency_events_.size() >= kMaxBufferedResidencyEvents) {
+    if (residency_events_dropped_ !=
+        std::numeric_limits<std::uint64_t>::max()) {
+      ++residency_events_dropped_;
+    }
+    return;
+  }
+  residency_events_.push_back(ExpertResidencyEvent{
+      next_residency_event_sequence_++,
+      timestamp_ns > 0 ? timestamp_ns : ResidencySteadyNowNs(),
+      entry.key.logical_expert_key, entry.residency_epoch, gpu_id, entry.bytes,
+      kind});
+}
+
 NodePtr ExpertResidencyManager::SelectVictim(const GpuState& state) const {
   NodePtr victim;
   std::size_t best_last_access = static_cast<std::size_t>(-1);
+  std::uint64_t best_frequency = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t best_sequence = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t best_logical_key = std::numeric_limits<std::uint64_t>::max();
   for (const auto& entry : state.entries) {
     if (!entry.node || entry.state != ResidencyState::ACTIVE) continue;
+    // Node execution state spans the complete consumer lifetime for generic
+    // topology groups and routed experts. An accounted entry is not an
+    // eviction candidate until that shared lifecycle says it is idle; manager
+    // leases below remain the independent transaction/execution ownership
+    // guard. Device is intentionally not inspected here: the existing external
+    // resize path can leave a host-moved entry charged, and selecting it lets
+    // EvictReserved reconcile that stale charge.
+    if (entry.node->is_prefetching.load(std::memory_order_acquire) ||
+        entry.node->exec_state.load(std::memory_order_acquire) !=
+            NodeExecState::IDLE ||
+        entry.node->pending_dispatches.load(std::memory_order_acquire) != 0) {
+      continue;
+    }
     if (entry.lease_count > 0 || NodeLeaseCount(entry.node->id) > 0) continue;
     if (protected_ids_.count(entry.node->id) > 0) continue;
     if (std::find(protected_variants_.begin(), protected_variants_.end(),
                   entry.key) != protected_variants_.end()) {
       continue;
     }
-    if (!victim || entry.node->last_access_time < best_last_access) {
+    if (eviction_policy_ == ExpertEvictionPolicy::LFU) {
+      const bool better = !victim || entry.demand_frequency < best_frequency ||
+                          (entry.demand_frequency == best_frequency &&
+                           (entry.last_demand_sequence < best_sequence ||
+                            (entry.last_demand_sequence == best_sequence &&
+                             entry.key.logical_expert_key < best_logical_key)));
+      if (better) {
+        victim = entry.node;
+        best_frequency = entry.demand_frequency;
+        best_sequence = entry.last_demand_sequence;
+        best_logical_key = entry.key.logical_expert_key;
+      }
+    } else if (!victim || entry.node->last_access_time < best_last_access ||
+               (entry.node->last_access_time == best_last_access &&
+                entry.key.logical_expert_key < best_logical_key)) {
       victim = entry.node;
       best_last_access = entry.node->last_access_time;
+      best_logical_key = entry.key.logical_expert_key;
     }
   }
   return victim;
@@ -241,6 +311,15 @@ ResidencyTicket ExpertResidencyManager::BeginAdmission(
     return ticket;
   }
   GpuState& state = StateFor(gpu_id);
+  if ((incoming.key.logical_expert_key & kCanonicalNodeResidencyTag) == 0) {
+    for (const auto& pending : pending_tickets_) {
+      if (pending.second.valid &&
+          pending.second.incoming_variant.key.logical_expert_key ==
+              incoming.key.logical_expert_key) {
+        return ticket;
+      }
+    }
+  }
   if (FindEntry(state, incoming.key) != nullptr) {
     ticket.outcome = AdmissionOutcome::ALREADY_RESIDENT;
     return ticket;
@@ -347,8 +426,8 @@ bool ExpertResidencyManager::EvictReserved(const ResidencyTicket& ticket) {
   }
   ResidencyTicket& pending = pending_it->second;
   GpuState& state = StateFor(pending.gpu_id);
-  const auto requested = pending.reserved_aligned_bytes +
-                         pending.reserved_workspace_bytes;
+  const auto requested =
+      pending.reserved_aligned_bytes + pending.reserved_workspace_bytes;
   auto charged = [&state]() {
     return state.resident_bytes + state.transition_reserved_bytes +
            state.workspace_bytes;
@@ -367,15 +446,53 @@ bool ExpertResidencyManager::EvictReserved(const ResidencyTicket& ticket) {
 
     ResidencyEntry* victim = FindEntry(state, *pending.reserved_victim_key);
     if (victim == nullptr || victim->lease_count != 1) return false;
-    if (transfer_ops_ && !transfer_ops_->MoveToHost(victim->node)) return false;
+    NodePtr victim_node = victim->node;
+    auto expected = NodeExecState::IDLE;
+    if (!victim_node->exec_state.compare_exchange_strong(
+            expected, NodeExecState::RESIZE_RESERVED,
+            std::memory_order_acq_rel)) {
+      return false;
+    }
+    bool moved = false;
+    try {
+      moved = !transfer_ops_ || transfer_ops_->MoveToHost(victim_node);
+    } catch (...) {
+      victim_node->exec_state.store(NodeExecState::IDLE,
+                                    std::memory_order_release);
+      throw;
+    }
+    if (!moved) {
+      victim_node->exec_state.store(NodeExecState::IDLE,
+                                    std::memory_order_release);
+      return false;
+    }
+    if ((victim->key.logical_expert_key & kCanonicalNodeResidencyTag) == 0) {
+      AppendEventLocked(*victim, pending.gpu_id, "evict");
+    }
+    if (victim->prefetched_unconsumed &&
+        (victim->key.logical_expert_key & kCanonicalNodeResidencyTag) == 0) {
+      if (unused_prefetch_eviction_count_ !=
+          std::numeric_limits<std::uint64_t>::max()) {
+        ++unused_prefetch_eviction_count_;
+      }
+      const auto bytes = static_cast<std::uint64_t>(
+          std::max<std::int64_t>(victim->bytes, static_cast<std::int64_t>(0)));
+      unused_prefetch_eviction_bytes_ =
+          bytes > std::numeric_limits<std::uint64_t>::max() -
+                      unused_prefetch_eviction_bytes_
+              ? std::numeric_limits<std::uint64_t>::max()
+              : unused_prefetch_eviction_bytes_ + bytes;
+      AppendEventLocked(*victim, pending.gpu_id, "unused_prefetch_evict");
+    }
     state.resident_bytes -= victim->bytes;
     const auto key = victim->key;
     state.entries.erase(
-        std::remove_if(state.entries.begin(), state.entries.end(),
-                       [&key](const ResidencyEntry& entry) {
-                         return entry.key == key;
-                       }),
+        std::remove_if(
+            state.entries.begin(), state.entries.end(),
+            [&key](const ResidencyEntry& entry) { return entry.key == key; }),
         state.entries.end());
+    victim_node->exec_state.store(NodeExecState::IDLE,
+                                  std::memory_order_release);
     pending.reserved_victim = nullptr;
     pending.reserved_victim_key.reset();
   }
@@ -422,6 +539,10 @@ bool ExpertResidencyManager::CommitTransaction(
     return false;
   }
 
+  std::uint64_t carried_frequency = 0;
+  std::uint64_t carried_sequence = 0;
+  bool carried_prefetched_unconsumed = false;
+  std::uint64_t carried_residency_epoch = 0;
   if (pending.kind == ResidencyTransactionKind::TRANSITION &&
       pending.replaced_key.has_value()) {
     ResidencyEntry* replaced = FindEntry(state, *pending.replaced_key);
@@ -431,6 +552,10 @@ bool ExpertResidencyManager::CommitTransaction(
       state.workspace_bytes -= pending.reserved_workspace_bytes;
       return false;
     }
+    carried_frequency = replaced->demand_frequency;
+    carried_sequence = replaced->last_demand_sequence;
+    carried_prefetched_unconsumed = replaced->prefetched_unconsumed;
+    carried_residency_epoch = replaced->residency_epoch;
     if (replaced->lease_count > 0) --replaced->lease_count;
     replaced->state = ResidencyState::RETIRING;
   }
@@ -441,6 +566,13 @@ bool ExpertResidencyManager::CommitTransaction(
   entry.key = pending.incoming_variant.key;
   entry.payload_bytes = pending.incoming_variant.payload_bytes;
   entry.state = ResidencyState::ACTIVE;
+  entry.demand_frequency = carried_frequency;
+  entry.last_demand_sequence = carried_sequence;
+  entry.prefetched_unconsumed = carried_prefetched_unconsumed ||
+                                pending.source == AdmissionSource::PREFETCH;
+  entry.residency_epoch = carried_residency_epoch != 0
+                              ? carried_residency_epoch
+                              : next_residency_epoch_++;
   state.entries.push_back(entry);
   state.resident_bytes += entry.bytes;
   state.transition_reserved_bytes -= pending.reserved_aligned_bytes;
@@ -450,6 +582,10 @@ bool ExpertResidencyManager::CommitTransaction(
         pending.reserved_workspace_bytes, nullptr};
   }
   pending_tickets_.erase(pending_it);
+  if (pending.source == AdmissionSource::PREFETCH &&
+      (entry.key.logical_expert_key & kCanonicalNodeResidencyTag) == 0) {
+    AppendEventLocked(state.entries.back(), pending.gpu_id, "prefetch_commit");
+  }
   return true;
 }
 
@@ -659,20 +795,178 @@ void ExpertResidencyManager::RecordStarvationPromotion() {
 }
 
 void ExpertResidencyManager::RecordAccess(const NodePtr& node,
-                                          ExpertPhase phase, bool hit) {
+                                          ExpertPhase phase, bool hit,
+                                          bool waited_for_prefetch,
+                                          std::int64_t arrival_ns) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!node) return;
+  (void)hit;
+
+  // Preserve the existing phase-policy accounting independently of the
+  // selected cache eviction policy.
   ExpertPolicyMetadata& meta = access_metadata_[node->id];
-  const std::uint64_t sequence = ++access_sequence_;
+  const std::uint64_t phase_sequence = ++access_sequence_;
   const ExpertPhase effective = EffectivePhase(phase);
   if (effective == ExpertPhase::PREFILL) {
     ++meta.prefill_accesses;
-    meta.last_prefill_sequence = sequence;
+    meta.last_prefill_sequence = phase_sequence;
   } else {
     ++meta.decode_accesses;
-    meta.last_decode_sequence = sequence;
+    meta.last_decode_sequence = phase_sequence;
   }
-  (void)hit;
+
+  auto& access_count = node->residency_key.has_value()
+                           ? routed_demand_accesses_
+                           : generic_demand_accesses_;
+  if (access_count != std::numeric_limits<std::uint64_t>::max()) {
+    ++access_count;
+  }
+
+  const auto logical_key =
+      node->residency_key.value_or(CanonicalNodeResidencyKey(node->id));
+  const int gpu_id = node->device.is_cuda() ? node->device.index() : -1;
+  ResidencyEntry* entry = FindActiveLogicalEntry(gpu_id, logical_key);
+  if (entry == nullptr) return;
+  const bool routed = node->residency_key.has_value();
+  const auto entry_bytes = static_cast<std::uint64_t>(
+      std::max<std::int64_t>(entry->bytes, static_cast<std::int64_t>(0)));
+  auto saturating_add = [](std::uint64_t* value, std::uint64_t increment) {
+    *value = increment > std::numeric_limits<std::uint64_t>::max() - *value
+                 ? std::numeric_limits<std::uint64_t>::max()
+                 : *value + increment;
+  };
+  if (routed) {
+    if (entry->prefetched_unconsumed) {
+      const bool late = waited_for_prefetch || !hit;
+      auto* count = late ? &prefetch_late_first_use_count_
+                         : &prefetch_ready_first_use_count_;
+      auto* bytes = late ? &prefetch_late_first_use_bytes_
+                         : &prefetch_ready_first_use_bytes_;
+      saturating_add(count, 1);
+      saturating_add(bytes, entry_bytes);
+      AppendEventLocked(
+          *entry, gpu_id,
+          late ? "prefetch_late_first_use" : "prefetch_ready_first_use",
+          arrival_ns);
+      entry->prefetched_unconsumed = false;
+    } else if (hit) {
+      saturating_add(&reuse_hit_count_, 1);
+      saturating_add(&reuse_hit_bytes_, entry_bytes);
+      AppendEventLocked(*entry, gpu_id, "reuse_hit", arrival_ns);
+    } else {
+      saturating_add(&demand_miss_count_, 1);
+      saturating_add(&demand_miss_bytes_, entry_bytes);
+      AppendEventLocked(*entry, gpu_id, "demand_miss", arrival_ns);
+    }
+  }
+  if (entry->demand_frequency != std::numeric_limits<std::uint64_t>::max()) {
+    ++entry->demand_frequency;
+  }
+  if (demand_access_sequence_ != std::numeric_limits<std::uint64_t>::max()) {
+    ++demand_access_sequence_;
+  }
+  entry->last_demand_sequence = demand_access_sequence_;
+}
+
+void ExpertResidencyManager::RecordDemandH2D(const NodePtr& node,
+                                             std::int64_t bytes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (demand_h2d_count_ != std::numeric_limits<std::uint64_t>::max()) {
+    ++demand_h2d_count_;
+  }
+  const auto increment =
+      static_cast<std::uint64_t>(std::max<std::int64_t>(bytes, 0));
+  demand_h2d_bytes_ =
+      increment > std::numeric_limits<std::uint64_t>::max() - demand_h2d_bytes_
+          ? std::numeric_limits<std::uint64_t>::max()
+          : demand_h2d_bytes_ + increment;
+  if (node && node->residency_key.has_value() && node->device.is_cuda()) {
+    if (auto* entry = FindActiveLogicalEntry(node->device.index(),
+                                             *node->residency_key)) {
+      AppendEventLocked(*entry, node->device.index(), "demand_h2d");
+    } else if (residency_events_.size() < (1U << 20)) {
+      residency_events_.push_back(ExpertResidencyEvent{
+          next_residency_event_sequence_++, ResidencySteadyNowNs(),
+          *node->residency_key, 0, node->device.index(), bytes,
+          "demand_h2d_uncommitted"});
+    } else if (residency_events_dropped_ !=
+               std::numeric_limits<std::uint64_t>::max()) {
+      ++residency_events_dropped_;
+    }
+  }
+}
+
+void ExpertResidencyManager::RecordPrefetchH2D(const NodePtr& node,
+                                               std::int64_t bytes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (prefetch_h2d_count_ != std::numeric_limits<std::uint64_t>::max()) {
+    ++prefetch_h2d_count_;
+  }
+  const auto increment =
+      static_cast<std::uint64_t>(std::max<std::int64_t>(bytes, 0));
+  prefetch_h2d_bytes_ = increment > std::numeric_limits<std::uint64_t>::max() -
+                                        prefetch_h2d_bytes_
+                            ? std::numeric_limits<std::uint64_t>::max()
+                            : prefetch_h2d_bytes_ + increment;
+  if (node && node->residency_key.has_value() && node->device.is_cuda()) {
+    if (auto* entry = FindActiveLogicalEntry(node->device.index(),
+                                             *node->residency_key)) {
+      AppendEventLocked(*entry, node->device.index(), "prefetch_h2d");
+    } else if (residency_events_.size() < (1U << 20)) {
+      residency_events_.push_back(ExpertResidencyEvent{
+          next_residency_event_sequence_++, ResidencySteadyNowNs(),
+          *node->residency_key, 0, node->device.index(), bytes,
+          "prefetch_h2d_discarded"});
+    } else if (residency_events_dropped_ !=
+               std::numeric_limits<std::uint64_t>::max()) {
+      ++residency_events_dropped_;
+    }
+  }
+}
+
+void ExpertResidencyManager::RecordPrefetchReleaseBegin(const NodePtr& node) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!node || !node->residency_key.has_value() || !node->device.is_cuda()) {
+    return;
+  }
+  if (auto* entry =
+          FindActiveLogicalEntry(node->device.index(), *node->residency_key)) {
+    AppendEventLocked(*entry, node->device.index(), "prefetch_release_begin");
+  }
+}
+
+void ExpertResidencyManager::RecordPrefetchReleaseReady(const NodePtr& node) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!node || !node->residency_key.has_value() || !node->device.is_cuda()) {
+    return;
+  }
+  if (auto* entry =
+          FindActiveLogicalEntry(node->device.index(), *node->residency_key)) {
+    AppendEventLocked(*entry, node->device.index(), "prefetch_release_ready");
+  }
+}
+
+std::vector<ExpertResidencyEvent> ExpertResidencyManager::DrainEvents() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<ExpertResidencyEvent> drained;
+  drained.swap(residency_events_);
+  return drained;
+}
+
+bool ExpertResidencyManager::ConfigureEvictionPolicy(
+    ExpertEvictionPolicy policy) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (policy != ExpertEvictionPolicy::LRU &&
+      policy != ExpertEvictionPolicy::LFU) {
+    return false;
+  }
+  eviction_policy_ = policy;
+  return true;
+}
+
+ExpertEvictionPolicy ExpertResidencyManager::EvictionPolicy() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return eviction_policy_;
 }
 
 ExpertPolicyStats ExpertResidencyManager::Snapshot() const {
@@ -745,6 +1039,83 @@ ExpertPolicyStats ExpertResidencyManager::Snapshot() const {
       static_cast<std::int64_t>(pending_tickets_.size());
   stats["peak_accounted_bytes"] =
       resident_bytes + transition_reserved_bytes + workspace_bytes;
+  stats["eviction_policy"] = static_cast<std::int64_t>(eviction_policy_);
+  const auto clamp_counter = [](std::uint64_t value) {
+    return value > static_cast<std::uint64_t>(
+                       std::numeric_limits<std::int64_t>::max())
+               ? std::numeric_limits<std::int64_t>::max()
+               : static_cast<std::int64_t>(value);
+  };
+  stats["routed_demand_accesses"] = clamp_counter(routed_demand_accesses_);
+  stats["generic_demand_accesses"] = clamp_counter(generic_demand_accesses_);
+  const auto total =
+      routed_demand_accesses_ > std::numeric_limits<std::uint64_t>::max() -
+                                    generic_demand_accesses_
+          ? std::numeric_limits<std::uint64_t>::max()
+          : routed_demand_accesses_ + generic_demand_accesses_;
+  stats["demand_accesses"] = clamp_counter(total);
+  stats["demand_h2d_count"] = clamp_counter(demand_h2d_count_);
+  stats["demand_h2d_bytes"] = clamp_counter(demand_h2d_bytes_);
+  stats["prefetch_h2d_count"] = clamp_counter(prefetch_h2d_count_);
+  stats["prefetch_h2d_bytes"] = clamp_counter(prefetch_h2d_bytes_);
+  stats["total_h2d_count"] = clamp_counter(
+      demand_h2d_count_ >
+              std::numeric_limits<std::uint64_t>::max() - prefetch_h2d_count_
+          ? std::numeric_limits<std::uint64_t>::max()
+          : demand_h2d_count_ + prefetch_h2d_count_);
+  stats["total_h2d_bytes"] = clamp_counter(
+      demand_h2d_bytes_ >
+              std::numeric_limits<std::uint64_t>::max() - prefetch_h2d_bytes_
+          ? std::numeric_limits<std::uint64_t>::max()
+          : demand_h2d_bytes_ + prefetch_h2d_bytes_);
+  stats["demand_miss_count"] = clamp_counter(demand_miss_count_);
+  stats["demand_miss_bytes"] = clamp_counter(demand_miss_bytes_);
+  stats["prefetch_ready_first_use_count"] =
+      clamp_counter(prefetch_ready_first_use_count_);
+  stats["prefetch_ready_first_use_bytes"] =
+      clamp_counter(prefetch_ready_first_use_bytes_);
+  stats["prefetch_late_first_use_count"] =
+      clamp_counter(prefetch_late_first_use_count_);
+  stats["prefetch_late_first_use_bytes"] =
+      clamp_counter(prefetch_late_first_use_bytes_);
+  stats["reuse_hit_count"] = clamp_counter(reuse_hit_count_);
+  stats["reuse_hit_bytes"] = clamp_counter(reuse_hit_bytes_);
+  stats["unused_prefetch_eviction_count"] =
+      clamp_counter(unused_prefetch_eviction_count_);
+  stats["unused_prefetch_eviction_bytes"] =
+      clamp_counter(unused_prefetch_eviction_bytes_);
+  const auto classified_accesses =
+      demand_miss_count_ + prefetch_ready_first_use_count_ +
+      prefetch_late_first_use_count_ + reuse_hit_count_;
+  stats["routed_access_partition_ok"] =
+      classified_accesses == routed_demand_accesses_ ? 1 : 0;
+  std::uint64_t unused_resident_count = 0;
+  std::uint64_t unused_resident_bytes = 0;
+  for (const auto& gpu : gpu_states_) {
+    for (const auto& entry : gpu.second.entries) {
+      if (!entry.prefetched_unconsumed ||
+          (entry.key.logical_expert_key & kCanonicalNodeResidencyTag) != 0) {
+        continue;
+      }
+      if (unused_resident_count != std::numeric_limits<std::uint64_t>::max()) {
+        ++unused_resident_count;
+      }
+      const auto bytes =
+          static_cast<std::uint64_t>(std::max<std::int64_t>(entry.bytes, 0));
+      unused_resident_bytes =
+          bytes > std::numeric_limits<std::uint64_t>::max() -
+                      unused_resident_bytes
+              ? std::numeric_limits<std::uint64_t>::max()
+              : unused_resident_bytes + bytes;
+    }
+  }
+  stats["unused_prefetch_resident_count"] =
+      clamp_counter(unused_resident_count);
+  stats["unused_prefetch_resident_bytes"] =
+      clamp_counter(unused_resident_bytes);
+  stats["residency_events_buffered"] =
+      static_cast<std::int64_t>(residency_events_.size());
+  stats["residency_events_dropped"] = clamp_counter(residency_events_dropped_);
   return stats;
 }
 

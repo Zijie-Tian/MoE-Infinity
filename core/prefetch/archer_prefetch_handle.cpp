@@ -122,9 +122,33 @@ void ArcherPrefetchHandle::ConfigureExpertPolicy(
   }
 }
 
+void ArcherPrefetchHandle::ConfigureExpertCachePolicy(int policy) {
+  TORCH_CHECK(policy == static_cast<int>(ExpertEvictionPolicy::LRU) ||
+                  policy == static_cast<int>(ExpertEvictionPolicy::LFU),
+              "invalid expert cache policy: ", policy);
+  TORCH_CHECK(kExpertResidencyManager != nullptr,
+              "expert residency manager is not initialized");
+  TORCH_CHECK(kExpertResidencyManager->ConfigureEvictionPolicy(
+                  static_cast<ExpertEvictionPolicy>(policy)),
+              "failed to configure expert cache policy: ", policy);
+}
+
+int ArcherPrefetchHandle::GetExpertCachePolicy() const {
+  TORCH_CHECK(kExpertResidencyManager != nullptr,
+              "expert residency manager is not initialized");
+  return static_cast<int>(kExpertResidencyManager->EvictionPolicy());
+}
+
 ExpertPolicyStats ArcherPrefetchHandle::GetExpertPolicyStats() const {
   if (!kExpertResidencyManager) return ExpertPolicyStats{};
   return kExpertResidencyManager->Snapshot();
+}
+
+std::vector<ExpertResidencyEvent>
+ArcherPrefetchHandle::DrainExpertResidencyEvents() {
+  return kExpertResidencyManager == nullptr
+             ? std::vector<ExpertResidencyEvent>{}
+             : kExpertResidencyManager->DrainEvents();
 }
 
 void ArcherPrefetchHandle::ResetCache() {
@@ -215,6 +239,13 @@ void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id,
     kTaskPool->StartExec(request_id, node);
     while (node->state.load() != 0) {
       std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+    // One topology group can contain multiple tensors.  Record its successful
+    // demand use once at the group-acquisition boundary, never once per tensor
+    // and never from the prefetch scheduler.
+    if (kExpertResidencyManager && kExpertResidencyManager->PolicyEnabled()) {
+      kExpertResidencyManager->RecordAccess(node, ExpertPhase::MIXED,
+                                            node->device.is_cuda());
     }
   }
 
@@ -328,6 +359,12 @@ void ArcherPrefetchHandle::EnqueuePrefetch(const uint32_t tensor_id,
   task->priority = 1;
   task->node = node;
   task->on_demand = false;
+  task->ordinary_predictive_prefetch = true;
+  task->prefetch_tensor_id = tensor_id;
+  if (node->residency_key.has_value() &&
+      ((*node->residency_key & kCanonicalNodeResidencyTag) == 0)) {
+    task->layer_id = static_cast<std::int64_t>(*node->residency_key >> 32);
+  }
   task->src_device = node->device;
   // task->dst_device = CUDA_DEVICE(gpu_id); // use default device for now
   task->dst_device = node->default_device;
@@ -336,7 +373,7 @@ void ArcherPrefetchHandle::EnqueuePrefetch(const uint32_t tensor_id,
 
 void ArcherPrefetchHandle::EnqueuePrefetchTensors(
     const std::vector<std::uint32_t>& tensor_ids, std::uint32_t priority,
-    int phase) {
+    int phase, std::uint64_t generation, std::int64_t layer_id) {
   TORCH_CHECK(phase >= static_cast<int>(ExpertPhase::PREFILL) &&
                   phase <= static_cast<int>(ExpertPhase::MIXED),
               "invalid expert phase: ", phase);
@@ -346,7 +383,16 @@ void ArcherPrefetchHandle::EnqueuePrefetchTensors(
     task->priority = priority;
     task->node = node;
     task->on_demand = false;
+    task->ordinary_predictive_prefetch = true;
+    task->prefetch_tensor_id = tensor_id;
+    task->generation = generation;
     task->phase = static_cast<ExpertPhase>(phase);
+    if (layer_id >= 0) {
+      task->layer_id = layer_id;
+    } else if (node->residency_key.has_value() &&
+               ((*node->residency_key & kCanonicalNodeResidencyTag) == 0)) {
+      task->layer_id = static_cast<std::int64_t>(*node->residency_key >> 32);
+    }
     task->src_device = node->device;
     task->dst_device = node->default_device;
     kTaskPool->EnqueueTask(task);
@@ -391,6 +437,10 @@ std::vector<PrefetchSample> ArcherPrefetchHandle::DrainPrefetchSamples() {
 
 std::int64_t ArcherPrefetchHandle::GetInflightPrefetchBytes() {
   return kTaskPool->GetInflightPrefetchBytes();
+}
+
+ExpertPolicyStats ArcherPrefetchHandle::GetPrefetchPipelineStats() {
+  return kTaskPool->GetPrefetchPipelineStats();
 }
 
 void ArcherPrefetchHandle::FetchTensors(

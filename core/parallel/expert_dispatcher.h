@@ -61,6 +61,9 @@ class ExpertDispatcher : public base::noncopyable {
     int gpu_id = -1;
     bool remote = false;
     bool wait_for_prefetch = false;
+    bool resident_at_arrival = false;
+    bool prefetch_in_progress_at_arrival = false;
+    std::int64_t demand_arrival_ns = 0;
     ExpertPhase phase = ExpertPhase::MIXED;
     std::uint64_t invocation_id = 0;
     // Stamp the creating generation so late workers cannot underflow a failed

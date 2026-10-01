@@ -219,17 +219,28 @@ struct PrefetchAdmission {
 };
 
 struct PrefetchSample {
+  std::uint64_t issue_id = 0;
   std::uint64_t generation = 0;
   std::int64_t layer_id = -1;
   std::uint32_t tensor_id = 0;
   std::int64_t bytes = 0;
+  std::int64_t h2d_bytes = 0;
   std::int64_t queue_wait_ns = 0;
   std::int64_t transfer_ns = 0;
+  std::int64_t enqueue_ns = 0;
+  std::int64_t start_ns = 0;
+  std::int64_t complete_ns = 0;
   std::string source_device;
   std::string outcome;
 };
 
 struct Task {
+  enum class PrefetchLifecycle : std::uint8_t {
+    kUntracked,
+    kQueued,
+    kRunning,
+    kTerminal,
+  };
   bool on_demand = false;
   NodePtr node;
   std::vector<NodePtr> remove_nodes;
@@ -243,9 +254,13 @@ struct Task {
 
   std::uint64_t generation = 0;
   std::int64_t layer_id = -1;
+  bool ordinary_predictive_prefetch = false;
+  std::uint32_t prefetch_tensor_id = UINT32_MAX;
   std::int64_t scheduled_bytes = 0;
   std::int64_t enqueue_ns = 0;
   std::int64_t start_ns = 0;
+  std::uint64_t prefetch_issue_id = 0;
+  PrefetchLifecycle prefetch_lifecycle = PrefetchLifecycle::kUntracked;
 
   bool remove_layer = false;
 
@@ -287,6 +302,9 @@ class ArcherTaskPool : public base::noncopyable {
   void ClearQueue() {
     std::lock_guard<std::mutex> lock(unified_mutex_);
     for (std::uint32_t priority = 1; priority < NUM_PRIORITY; priority++) {
+      for (const auto& task : unified_queue_[priority]) {
+        TrackPrefetchTerminal(task, "canceled_clear");
+      }
       unified_queue_[priority].clear();
     }
   }
@@ -304,6 +322,7 @@ class ArcherTaskPool : public base::noncopyable {
       const std::unordered_set<std::uint32_t>& keep_tensor_ids);
   std::vector<PrefetchSample> DrainPrefetchSamples();
   std::int64_t GetInflightPrefetchBytes();
+  ExpertPolicyStats GetPrefetchPipelineStats();
 
   void ReplaceCacheCandidates(const NodePtrList& candidates) {
     std::lock_guard<std::mutex> lock(unified_mutex_);
@@ -316,6 +335,9 @@ class ArcherTaskPool : public base::noncopyable {
     }
 
     for (std::uint32_t priority = 1; priority < NUM_PRIORITY; priority++) {
+      for (const auto& task : unified_queue_[priority]) {
+        TrackPrefetchTerminal(task, "canceled_replace");
+      }
       unified_queue_[priority].clear();
     }
   }
@@ -345,8 +367,16 @@ class ArcherTaskPool : public base::noncopyable {
 
  private:
   void GPUThreadFunc(int gpu_id, int thread_id);
+  void RunTrackedRoutedPrefetch(const TaskPtr& task, int gpu_id);
 
-  void SetNodeDevice(const TaskPtr& task);
+  bool SetNodeDevice(const TaskPtr& task, bool claim_already_owned = false);
+
+  bool IsTrackedRoutedPrefetch(const TaskPtr& task) const;
+  void TrackPrefetchIssue(const TaskPtr& task);
+  void TrackPrefetchStarted(const TaskPtr& task);
+  void TrackPrefetchTerminal(const TaskPtr& task, const std::string& outcome,
+                             std::int64_t h2d_bytes = 0,
+                             std::int64_t transfer_ns = 0);
 
   std::string DebugString(const std::vector<std::deque<TaskPtr>>& queue);
 
@@ -384,6 +414,14 @@ class ArcherTaskPool : public base::noncopyable {
   std::unordered_map<std::uint32_t, std::uint64_t> tensor_generation_;
   std::unordered_map<std::uint32_t, std::int64_t> tensor_layer_;
   std::vector<PrefetchSample> prefetch_samples_;
+
+  std::mutex prefetch_pipeline_mutex_;
+  ExpertPolicyStats prefetch_pipeline_counters_;
+  std::int64_t prefetch_queued_count_ = 0;
+  std::int64_t prefetch_queued_bytes_ = 0;
+  std::int64_t prefetch_running_count_ = 0;
+  std::int64_t prefetch_running_bytes_ = 0;
+  std::uint64_t next_prefetch_issue_id_ = 1;
 };
 
 extern std::unique_ptr<ArcherTaskPool> kTaskPool;

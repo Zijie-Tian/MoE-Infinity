@@ -740,18 +740,54 @@ class OffloadEngine(object):
         self.expert_prefetcher.phase_policy = phase_policy
         if not phase_policy.enabled:
             return
-        configure = getattr(self.archer_engine, "configure_phase_policy", None)
-        if callable(configure):
-            # Match AdmissionMode in core/prefetch/expert_policy.h. The public
-            # config uses names, while the pybind boundary takes integer enums.
-            admission_modes = {"cache": 0, "transient_on_pressure": 1}
-            configure(
-                phase_policy.enabled,
-                admission_modes[phase_policy.prefill_admission],
-                admission_modes[phase_policy.decode_admission],
-                phase_policy.prefill_eviction_weight,
-                phase_policy.decode_eviction_weight,
-                phase_policy.starvation_limit,
+        configure_phase = getattr(
+            self.archer_engine, "configure_phase_policy", None
+        )
+        configure_cache = getattr(
+            self.archer_engine, "configure_expert_cache_policy", None
+        )
+        get_cache_policy = getattr(
+            self.archer_engine, "get_expert_cache_policy", None
+        )
+        required_apis = {
+            "configure_phase_policy": configure_phase,
+            "configure_expert_cache_policy": configure_cache,
+            "get_expert_cache_policy": get_cache_policy,
+        }
+        missing = [
+            name
+            for name, member in required_apis.items()
+            if not callable(member)
+        ]
+        if missing:
+            raise RuntimeError(
+                "native expert cache policy API is unavailable; rebuild the "
+                f"moe_infinity._store extension (missing: {', '.join(missing)})"
+            )
+
+        # Match the native enums in core/prefetch/expert_policy.h. Public
+        # configuration uses names while the pybind boundary takes integers.
+        admission_modes = {"cache": 0, "transient_on_pressure": 1}
+        cache_policies = {"lru": 0, "lfu": 1}
+        configure_phase(
+            phase_policy.enabled,
+            admission_modes[phase_policy.prefill_admission],
+            admission_modes[phase_policy.decode_admission],
+            phase_policy.prefill_eviction_weight,
+            phase_policy.decode_eviction_weight,
+            phase_policy.starvation_limit,
+        )
+        requested_policy = cache_policies[self.archer_config.expert_cache_policy]
+        configure_cache(requested_policy)
+        configured_policy = get_cache_policy()
+        if (
+            type(configured_policy) is not int
+            or configured_policy != requested_policy
+        ):
+            raise RuntimeError(
+                "native expert cache policy readback mismatch: requested "
+                f"{self.archer_config.expert_cache_policy!r} ({requested_policy}), "
+                f"got {configured_policy!r}"
             )
 
     @property

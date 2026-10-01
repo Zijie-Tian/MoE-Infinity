@@ -14,6 +14,10 @@ enum class AdmissionMode : std::uint8_t {
   TRANSIENT_ON_PRESSURE = 1
 };
 
+// Eviction policy for the shared, byte-accounted residency manager.  Keep the
+// numeric values stable: they are part of the Python extension boundary.
+enum class ExpertEvictionPolicy : std::uint8_t { LRU = 0, LFU = 1 };
+
 inline std::uint32_t ServiceClass(std::uint32_t priority,
                                   std::uint32_t bypasses, std::uint32_t limit) {
   if (priority == 0) return 0;

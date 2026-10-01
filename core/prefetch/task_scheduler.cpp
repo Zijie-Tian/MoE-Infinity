@@ -20,6 +20,209 @@
 
 std::unique_ptr<ArcherTaskPool> kTaskPool = nullptr;
 
+namespace {
+
+std::int64_t PrefetchSteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+class PrefetchNodeClaimGuard {
+ public:
+  explicit PrefetchNodeClaimGuard(NodePtr node) : node_(std::move(node)) {}
+
+  bool Claim() {
+    node_->is_prefetching.store(true, std::memory_order_release);
+    auto expected = NodeExecState::IDLE;
+    if (!node_->exec_state.compare_exchange_strong(
+            expected, NodeExecState::FETCHING, std::memory_order_acq_rel)) {
+      node_->is_prefetching.store(false, std::memory_order_release);
+      return false;
+    }
+    claimed_ = true;
+    return true;
+  }
+
+  void Release() {
+    if (!claimed_) return;
+    node_->exec_state.store(NodeExecState::IDLE, std::memory_order_release);
+    node_->is_prefetching.store(false, std::memory_order_release);
+    claimed_ = false;
+  }
+
+  ~PrefetchNodeClaimGuard() { Release(); }
+
+ private:
+  NodePtr node_;
+  bool claimed_ = false;
+};
+
+}  // namespace
+
+void ArcherTaskPool::RunTrackedRoutedPrefetch(const TaskPtr& task, int gpu_id) {
+  TrackPrefetchStarted(task);
+  if (expert_residency_detail::HasActiveCanonicalVariant(
+          kExpertResidencyManager, gpu_id, task->node)) {
+    TrackPrefetchTerminal(task, "already_resident");
+    return;
+  }
+  PrefetchNodeClaimGuard node_claim(task->node);
+  if (!node_claim.Claim()) {
+    TrackPrefetchTerminal(task, "state_conflict");
+    return;
+  }
+
+  ResidencyTicket ticket;
+  bool moved_to_gpu = false;
+  auto rollback_uncommitted_move = [&] {
+    if (!moved_to_gpu || !task->node->device.is_cuda()) return;
+    try {
+      task->node->SetDevice(task->node->default_host);
+    } catch (...) {
+    }
+  };
+  expert_residency_detail::PendingAdmissionGuard ticket_guard(
+      kExpertResidencyManager);
+  try {
+    ticket = kExpertResidencyManager->BeginAdmission(
+        task->node, gpu_id, task->phase,
+        kExpertResidencyManager->AdmissionFor(task->phase),
+        AdmissionSource::PREFETCH);
+    if (!ticket.valid) {
+      TrackPrefetchTerminal(task,
+                            ticket.outcome == AdmissionOutcome::ALREADY_RESIDENT
+                                ? "already_resident"
+                                : "admission_rejected");
+      return;
+    }
+    ticket_guard.Arm(&ticket);
+    if (ticket.transient) {
+      TrackPrefetchTerminal(task, "admission_rejected");
+      return;
+    }
+    if (ticket.reserved_victim != nullptr &&
+        !kExpertResidencyManager->EvictReserved(ticket)) {
+      TrackPrefetchTerminal(task, "eviction_failed");
+      return;
+    }
+
+    const auto transfer_start = PrefetchSteadyNowNs();
+    if (!SetNodeDevice(task, true) || !task->node->device.is_cuda()) {
+      TrackPrefetchTerminal(task, "transfer_failed");
+      return;
+    }
+    moved_to_gpu = true;
+    const auto transfer_ns = PrefetchSteadyNowNs() - transfer_start;
+    if (!kExpertResidencyManager->CommitAdmission(ticket)) {
+      kExpertResidencyManager->RecordPrefetchH2D(task->node,
+                                                 task->node->byte_size);
+      rollback_uncommitted_move();
+      TrackPrefetchTerminal(task, "commit_failed", task->node->byte_size,
+                            transfer_ns);
+      return;
+    }
+    ticket_guard.Disarm();
+    kExpertResidencyManager->RecordPrefetchH2D(task->node,
+                                               task->node->byte_size);
+    TrackPrefetchTerminal(task, "completed_h2d", task->node->byte_size,
+                          transfer_ns);
+    kExpertResidencyManager->RecordPrefetchReleaseBegin(task->node);
+    node_claim.Release();
+    kExpertResidencyManager->RecordPrefetchReleaseReady(task->node);
+  } catch (...) {
+    rollback_uncommitted_move();
+    TrackPrefetchTerminal(task, "transfer_failed");
+  }
+}
+
+bool ArcherTaskPool::IsTrackedRoutedPrefetch(const TaskPtr& task) const {
+  return kExpertResidencyManager != nullptr &&
+         kExpertResidencyManager->PolicyEnabled() && task != nullptr &&
+         !task->on_demand && task->priority > 0 &&
+         task->ordinary_predictive_prefetch && task->node != nullptr &&
+         task->node->residency_key.has_value();
+}
+
+void ArcherTaskPool::TrackPrefetchIssue(const TaskPtr& task) {
+  if (!IsTrackedRoutedPrefetch(task)) return;
+  std::lock_guard<std::mutex> lock(prefetch_pipeline_mutex_);
+  if (task->prefetch_lifecycle != Task::PrefetchLifecycle::kUntracked) return;
+  task->prefetch_issue_id = next_prefetch_issue_id_++;
+  task->scheduled_bytes = task->node->byte_size;
+  task->enqueue_ns = PrefetchSteadyNowNs();
+  task->prefetch_lifecycle = Task::PrefetchLifecycle::kQueued;
+  ++prefetch_queued_count_;
+  prefetch_queued_bytes_ += task->scheduled_bytes;
+  ++prefetch_pipeline_counters_["prefetch_issued_count"];
+  prefetch_pipeline_counters_["prefetch_issued_bytes"] += task->scheduled_bytes;
+}
+
+void ArcherTaskPool::TrackPrefetchStarted(const TaskPtr& task) {
+  if (!IsTrackedRoutedPrefetch(task)) return;
+  std::lock_guard<std::mutex> lock(prefetch_pipeline_mutex_);
+  if (task->prefetch_lifecycle != Task::PrefetchLifecycle::kQueued) return;
+  task->prefetch_lifecycle = Task::PrefetchLifecycle::kRunning;
+  task->start_ns = PrefetchSteadyNowNs();
+  --prefetch_queued_count_;
+  prefetch_queued_bytes_ -= task->scheduled_bytes;
+  ++prefetch_running_count_;
+  prefetch_running_bytes_ += task->scheduled_bytes;
+  ++prefetch_pipeline_counters_["prefetch_started_count"];
+  prefetch_pipeline_counters_["prefetch_started_bytes"] +=
+      task->scheduled_bytes;
+}
+
+void ArcherTaskPool::TrackPrefetchTerminal(const TaskPtr& task,
+                                           const std::string& outcome,
+                                           std::int64_t h2d_bytes,
+                                           std::int64_t transfer_ns) {
+  if (!IsTrackedRoutedPrefetch(task)) return;
+  std::lock_guard<std::mutex> lock(prefetch_pipeline_mutex_);
+  if (task->prefetch_lifecycle == Task::PrefetchLifecycle::kTerminal ||
+      task->prefetch_lifecycle == Task::PrefetchLifecycle::kUntracked) {
+    return;
+  }
+  if (task->prefetch_lifecycle == Task::PrefetchLifecycle::kQueued) {
+    --prefetch_queued_count_;
+    prefetch_queued_bytes_ -= task->scheduled_bytes;
+  } else {
+    --prefetch_running_count_;
+    prefetch_running_bytes_ -= task->scheduled_bytes;
+  }
+  task->prefetch_lifecycle = Task::PrefetchLifecycle::kTerminal;
+  ++prefetch_pipeline_counters_["prefetch_terminal_count"];
+  prefetch_pipeline_counters_["prefetch_terminal_bytes"] +=
+      task->scheduled_bytes;
+  ++prefetch_pipeline_counters_["prefetch_" + outcome + "_count"];
+  prefetch_pipeline_counters_["prefetch_" + outcome + "_bytes"] +=
+      task->scheduled_bytes;
+  if (h2d_bytes > 0) {
+    ++prefetch_pipeline_counters_["prefetch_h2d_count"];
+    prefetch_pipeline_counters_["prefetch_h2d_bytes"] += h2d_bytes;
+    if (outcome != "completed_h2d") {
+      ++prefetch_pipeline_counters_["prefetch_discarded_h2d_count"];
+      prefetch_pipeline_counters_["prefetch_discarded_h2d_bytes"] += h2d_bytes;
+    }
+  }
+  PrefetchSample sample;
+  sample.issue_id = task->prefetch_issue_id;
+  sample.generation = task->generation;
+  sample.layer_id = task->layer_id;
+  sample.tensor_id = task->prefetch_tensor_id;
+  sample.bytes = task->scheduled_bytes;
+  sample.h2d_bytes = h2d_bytes;
+  sample.queue_wait_ns =
+      task->start_ns > 0 ? task->start_ns - task->enqueue_ns : 0;
+  sample.transfer_ns = transfer_ns;
+  sample.enqueue_ns = task->enqueue_ns;
+  sample.start_ns = task->start_ns;
+  sample.complete_ns = PrefetchSteadyNowNs();
+  sample.source_device = task->src_device.str();
+  sample.outcome = outcome;
+  prefetch_samples_.push_back(std::move(sample));
+}
+
 ArcherTaskPool::ArcherTaskPool() {
   unified_queue_.resize(NUM_PRIORITY);
 
@@ -60,12 +263,19 @@ void ArcherTaskPool::FetchExec(const std::uint64_t& request_id,
     std::lock_guard<std::mutex> lock(unified_mutex_);
     for (std::size_t i = 1; i < NUM_PRIORITY; ++i) {
       unified_queue_[i].erase(
-          std::remove_if(unified_queue_[i].begin(), unified_queue_[i].end(),
-                         [&](auto& t) {
-                           return (t->node == node) |
-                                  ((node->corr_id & 0xffffffff) >=
-                                   (t->node->corr_id & 0xffffffff));
-                         }),
+          std::remove_if(
+              unified_queue_[i].begin(), unified_queue_[i].end(),
+              [&](auto& t) {
+                const bool same_node = t->node == node;
+                const bool obsolete = (node->corr_id & 0xffffffff) >=
+                                      (t->node->corr_id & 0xffffffff);
+                const bool remove = same_node | obsolete;
+                if (remove) {
+                  TrackPrefetchTerminal(t, same_node ? "canceled_fetch_sweep"
+                                                     : "canceled_obsolete");
+                }
+                return remove;
+              }),
           unified_queue_[i].end());
     }
   }
@@ -88,6 +298,7 @@ void ArcherTaskPool::EnqueueTask(const TaskPtr& task) {
 #endif
 
   DLOG_TRACE("EnqueueTask: {}", task->DebugString());
+  TrackPrefetchIssue(task);
 
   {
     std::lock_guard<std::mutex> lock(unified_mutex_);
@@ -102,9 +313,13 @@ void ArcherTaskPool::EnqueueTask(const TaskPtr& task) {
                                        (task->node->corr_id & 0xffffffff));
             bool need_remove =
                 (is_same_node && is_lower_priority) || is_outdate_layers;
-            if (need_remove)
-              t->node->exec_state.store(NodeExecState::IDLE,
-                                        std::memory_order_release);
+            if (need_remove) {
+              TrackPrefetchTerminal(t, "canceled_duplicate");
+              if (!IsTrackedRoutedPrefetch(t)) {
+                t->node->exec_state.store(NodeExecState::IDLE,
+                                          std::memory_order_release);
+              }
+            }
             return need_remove;
           });
       unified_queue_[i].erase(it, unified_queue_[i].end());
@@ -112,6 +327,7 @@ void ArcherTaskPool::EnqueueTask(const TaskPtr& task) {
   }
 
   if (task->src_device == task->dst_device) {
+    TrackPrefetchTerminal(task, "already_resident");
     task->node->state = 0;
     task->node->cv.notify_all();
     DLOG_TRACE("EnqueueTask: {} is on the same device", task->DebugString());
@@ -171,8 +387,15 @@ void ArcherTaskPool::StartExec(const std::uint64_t& request_id,
       // remove any task that has the same node
       auto it = std::remove_if(
           unified_queue_[i].begin(), unified_queue_[i].end(), [&](auto& t) {
-            return (t->node == node) | ((node->corr_id & 0xffffffff) >
-                                        (t->node->corr_id & 0xffffffff));
+            const bool same_node = t->node == node;
+            const bool obsolete =
+                (node->corr_id & 0xffffffff) > (t->node->corr_id & 0xffffffff);
+            const bool remove = same_node | obsolete;
+            if (remove) {
+              TrackPrefetchTerminal(
+                  t, same_node ? "canceled_fetch_sweep" : "canceled_obsolete");
+            }
+            return remove;
           });
       unified_queue_[i].erase(it, unified_queue_[i].end());
     }
@@ -519,8 +742,13 @@ void ArcherTaskPool::GPUThreadFunc(int gpu_id, int thread_id) {
       unified_queue_[i].erase(
           std::remove_if(unified_queue_[i].begin(), unified_queue_[i].end(),
                          [&, task](auto& t) {
-                           return (t->node == node) &
-                                  (t->dst_device == task->dst_device);
+                           const bool remove =
+                               (t->node == node) &
+                               (t->dst_device == task->dst_device);
+                           if (remove && t != task) {
+                             TrackPrefetchTerminal(t, "canceled_duplicate");
+                           }
+                           return remove;
                          }),
           unified_queue_[i].end());
     }
@@ -528,6 +756,11 @@ void ArcherTaskPool::GPUThreadFunc(int gpu_id, int thread_id) {
     DLOG_TRACE(("Execute task " + task->DebugString()).c_str());
 
     lock.unlock();
+
+    if (IsTrackedRoutedPrefetch(task)) {
+      RunTrackedRoutedPrefetch(task, gpu_id);
+      continue;
+    }
 
     ResidencyTicket residency_ticket;
     if (!task->on_demand && managed) {
@@ -578,12 +811,13 @@ void ArcherTaskPool::GPUThreadFunc(int gpu_id, int thread_id) {
   }
 }
 
-void ArcherTaskPool::SetNodeDevice(const TaskPtr& task) {
+bool ArcherTaskPool::SetNodeDevice(const TaskPtr& task,
+                                   bool claim_already_owned) {
   auto node = task->node;
 
   DLOG_TRACE("SetNodeDevice: task: {}, node: {}", task->DebugString(),
              node->str());
-  if (!task->on_demand) {
+  if (!task->on_demand && !claim_already_owned) {
     node->is_prefetching.store(true, std::memory_order_release);
     auto expected = NodeExecState::IDLE;
     if (!node->exec_state.compare_exchange_strong(
@@ -591,18 +825,18 @@ void ArcherTaskPool::SetNodeDevice(const TaskPtr& task) {
       node->is_prefetching.store(false, std::memory_order_release);
       DLOG_TRACE("SetNodeDevice: task: {}, exec_state not IDLE",
                  task->DebugString());
-      return;
+      return false;
     }
   }
 
   if (node->device.type() == task->dst_device.type()) {
     DLOG_TRACE("SetNodeDevice: task: {}, skip same device",
                task->DebugString());
-    if (!task->on_demand) {
+    if (!task->on_demand && !claim_already_owned) {
       node->exec_state.store(NodeExecState::IDLE, std::memory_order_release);
       node->is_prefetching.store(false, std::memory_order_release);
     }
-    return;
+    return true;
   }
 
   auto start_time = MCIROSECONDS_SINCE_EPOCH;
@@ -618,7 +852,7 @@ void ArcherTaskPool::SetNodeDevice(const TaskPtr& task) {
   DLOG_TRACE("SetNodeDevice: task: {}, emplace time {} us", task->DebugString(),
              end_time - start_time);
 
-  if (!task->on_demand) {
+  if (!task->on_demand && !claim_already_owned) {
     node->exec_state.store(NodeExecState::IDLE, std::memory_order_release);
     node->is_prefetching.store(false, std::memory_order_release);
   }
@@ -634,6 +868,7 @@ void ArcherTaskPool::SetNodeDevice(const TaskPtr& task) {
     DLOG_TRACE("Prefetch Node: task: {}, prefetch_cnt: {}", task->DebugString(),
                node_body->prefetch_cnt);
   }
+  return true;
 }
 
 PrefetchAdmission ArcherTaskPool::AdmitPrefetchTasks(
@@ -707,8 +942,16 @@ std::int64_t ArcherTaskPool::CancelQueuedPrefetch(
               if (t == nullptr || t->node == nullptr) return false;
               if (t->generation != generation || t->layer_id != layer_id)
                 return false;
-              auto tensor_id = static_cast<std::uint32_t>(t->node->id);
+              const bool tracked = IsTrackedRoutedPrefetch(t);
+              auto tensor_id = tracked
+                                   ? t->prefetch_tensor_id
+                                   : static_cast<std::uint32_t>(t->node->id);
               if (keep_tensor_ids.count(tensor_id) > 0) return false;
+              if (tracked) {
+                TrackPrefetchTerminal(t, "canceled_explicit");
+                canceled += t->scheduled_bytes;
+                return true;
+              }
               std::int64_t bytes = prefetch_accounting_.CancelQueued(tensor_id);
               if (bytes > 0) {
                 canceled += bytes;
@@ -723,15 +966,87 @@ std::int64_t ArcherTaskPool::CancelQueuedPrefetch(
 }
 
 std::vector<PrefetchSample> ArcherTaskPool::DrainPrefetchSamples() {
-  std::lock_guard<std::mutex> lock(prefetch_accounting_mutex_);
+  std::lock_guard<std::mutex> lock(prefetch_pipeline_mutex_);
   std::vector<PrefetchSample> drained;
   drained.swap(prefetch_samples_);
   return drained;
 }
 
 std::int64_t ArcherTaskPool::GetInflightPrefetchBytes() {
-  std::lock_guard<std::mutex> lock(prefetch_accounting_mutex_);
-  return prefetch_accounting_.inflight_bytes();
+  std::scoped_lock lock(prefetch_accounting_mutex_, prefetch_pipeline_mutex_);
+  return prefetch_accounting_.inflight_bytes() + prefetch_queued_bytes_ +
+         prefetch_running_bytes_;
+}
+
+ExpertPolicyStats ArcherTaskPool::GetPrefetchPipelineStats() {
+  std::lock_guard<std::mutex> lock(prefetch_pipeline_mutex_);
+  ExpertPolicyStats stats = prefetch_pipeline_counters_;
+  static const char* outcomes[] = {
+      "completed_h2d",    "already_resident",     "admission_rejected",
+      "eviction_failed",  "state_conflict",       "transfer_failed",
+      "commit_failed",    "canceled_duplicate",   "canceled_clear",
+      "canceled_replace", "canceled_fetch_sweep", "canceled_obsolete",
+      "canceled_explicit"};
+  for (const char* outcome : outcomes) {
+    stats.emplace(std::string("prefetch_") + outcome + "_count", 0);
+    stats.emplace(std::string("prefetch_") + outcome + "_bytes", 0);
+  }
+  for (const char* key :
+       {"prefetch_issued_count", "prefetch_issued_bytes",
+        "prefetch_started_count", "prefetch_started_bytes",
+        "prefetch_terminal_count", "prefetch_terminal_bytes",
+        "prefetch_h2d_count", "prefetch_h2d_bytes",
+        "prefetch_discarded_h2d_count", "prefetch_discarded_h2d_bytes"}) {
+    stats.emplace(key, 0);
+  }
+  stats["prefetch_completed_count"] = stats["prefetch_completed_h2d_count"];
+  stats["prefetch_completed_bytes"] = stats["prefetch_completed_h2d_bytes"];
+  stats["prefetch_already_resident_count"] =
+      stats["prefetch_already_resident_count"];
+  stats["prefetch_already_resident_bytes"] =
+      stats["prefetch_already_resident_bytes"];
+  stats["prefetch_rejected_count"] = stats["prefetch_admission_rejected_count"];
+  stats["prefetch_rejected_bytes"] = stats["prefetch_admission_rejected_bytes"];
+  stats["prefetch_canceled_count"] =
+      stats["prefetch_canceled_duplicate_count"] +
+      stats["prefetch_canceled_clear_count"] +
+      stats["prefetch_canceled_replace_count"] +
+      stats["prefetch_canceled_fetch_sweep_count"] +
+      stats["prefetch_canceled_obsolete_count"] +
+      stats["prefetch_canceled_explicit_count"];
+  stats["prefetch_canceled_bytes"] =
+      stats["prefetch_canceled_duplicate_bytes"] +
+      stats["prefetch_canceled_clear_bytes"] +
+      stats["prefetch_canceled_replace_bytes"] +
+      stats["prefetch_canceled_fetch_sweep_bytes"] +
+      stats["prefetch_canceled_obsolete_bytes"] +
+      stats["prefetch_canceled_explicit_bytes"];
+  stats["prefetch_failed_count"] = stats["prefetch_eviction_failed_count"] +
+                                   stats["prefetch_state_conflict_count"] +
+                                   stats["prefetch_transfer_failed_count"] +
+                                   stats["prefetch_commit_failed_count"];
+  stats["prefetch_failed_bytes"] = stats["prefetch_eviction_failed_bytes"] +
+                                   stats["prefetch_state_conflict_bytes"] +
+                                   stats["prefetch_transfer_failed_bytes"] +
+                                   stats["prefetch_commit_failed_bytes"];
+  stats["prefetch_queued_count"] = prefetch_queued_count_;
+  stats["prefetch_queued_bytes"] = prefetch_queued_bytes_;
+  stats["prefetch_running_count"] = prefetch_running_count_;
+  stats["prefetch_running_bytes"] = prefetch_running_bytes_;
+  stats["prefetch_inflight_count"] =
+      prefetch_queued_count_ + prefetch_running_count_;
+  stats["prefetch_inflight_bytes"] =
+      prefetch_queued_bytes_ + prefetch_running_bytes_;
+  const auto issued_count = stats["prefetch_issued_count"];
+  const auto issued_bytes = stats["prefetch_issued_bytes"];
+  stats["prefetch_accounting_invariant"] =
+      issued_count == stats["prefetch_terminal_count"] +
+                          stats["prefetch_inflight_count"] &&
+              issued_bytes == stats["prefetch_terminal_bytes"] +
+                                  stats["prefetch_inflight_bytes"]
+          ? 1
+          : 0;
+  return stats;
 }
 
 std::string ArcherTaskPool::DebugString(
@@ -749,7 +1064,8 @@ std::string ArcherTaskPool::DebugString(
       }
       ss << std::hex << node->id << "[" << node->device << "->"
          << task->dst_device.str() << "," << task->remove_nodes.size() << ","
-         << "]" << " " << std::dec;
+         << "]"
+         << " " << std::dec;
     }
     ss << std::endl;
   }
