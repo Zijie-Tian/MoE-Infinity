@@ -1,24 +1,108 @@
-# MoE-Infinity 专家缓存实验：预取 ON 全表与代码改动说明
-
-> **2026-10-01 后续回退说明：** 按用户要求，三个 DFlash 测试、共享 `expert_executor.py` / `expert_prefetcher.py` 及两个配套 unit-test 期待已恢复为 `f7f56df` 版本。真正 LFU、C++ 缓存实现和 C++ 单元测试保留。本文数字属于回退前 `286970…` 修改版本的历史实验，**不再声称对应当前工作树，也不可直接用当前共享 Python 接口运行旧 frozen 预取观测 harness**。原数据与修改前补丁均保留，未改写成绩。
+# MoE-Infinity 普通 MoE 推理：专家预取与缓存命中率测试报告
 
 - 实验日期：2026-09-30。
-- 保存日期：2026-09-30。
-- 适用版本：本机修改后的 MoE-Infinity；不是未经修改的上游发行版。
-- Git 基线：`f7f56df`；基线之后的 LFU、预取修复及测试修改均未提交。
-- 本文先保存最终结果，再说明哪些改动影响功能、哪些只是观测与校验。
+- 报告修订日期：2026-10-01。
+- 研究对象：普通自回归 MoE 推理中的专家参数预取，以及 LRU/LFU 在不同缓存容量下的 decode 命中率。
+- 实验规模：4 个模型 × 3 档容量 × 2 种策略，共 24 个配置；专家预取均开启。
 
-## 结论与统计口径
+> **版本说明：** 本文保留历史实验结果，测量对象是 `f7f56df` 基线加源代码补丁 `286970…` 的本地版本，不是未经修改的上游版本。后续部分 Python 预取改动已撤回，保留的 LFU、原生缓存实现及测试已提交到 `620b343`。因此，本文数字**不代表当前提交重新运行的结果**，旧实验脚本也不能直接套用到当前 Python 接口。此次仅重写报告，没有重新测量或更改原始数据。
 
-四模型 × 4/8/16 GiB × 本地 C++ 管理器中的 managed LRU / resident LFU（真正 LFU 是此前按用户要求新增的实现），共 24 个配置：**20 个完整成功、4 个明确 CUDA OOM**。独立验证 **5008 项 PASS、0 FAIL、0 INCOMPLETE**；失败不记为 0%。
+## 实验目的与模型
 
-以下主表为 **decode**，汇总两次测量请求，排除一次 warmup。每请求输入 512 token、生成 64 token，batch=1、BF16，单个物理 GPU；仅使用 GPU 1/2/3/4。缓存容量为共享 residency manager 的逻辑预算，包含被管理的非路由参数，**不是 expert-only 或全卡显存硬上限**。
+本实验回答两个问题：
 
-- Hit = native 到达/就绪分类中的 `prefetch_ready_first_use + reuse_hit`。
-- Miss = `prefetch_late_first_use + demand_miss`；预取已启动但需要时未就绪仍算 miss。
-- 查找单位为一次层调用中一个 unique active `(layer, expert)`；decode batch=1 每层等于该层 routed top-k。
-- Python `is_tensor_on_device` 仅为时间线交叉检查，不作为异步预取的主命中计数。
-- 相对于本次预取 OFF 的本地基线，保留 LRU/LFU 淘汰排序、模型 gate 实现、BF16 和请求预算；但预取接线、目标层纠错及并发生命周期确有功能性修复，不能理解为只加日志。所有 baseline commit 之后的代码修改仍未提交。
+1. 开启专家参数预取后，四个模型在 decode 阶段的缓存命中率、未命中率分别是多少？
+2. 在相同模型、请求和容量条件下，LRU 与 LFU 的表现如何；容量由 4 GiB 增加到 8/16 GiB 后，结果怎样变化？
+
+| 模型 | 本地模型路径 |
+|---|---|
+| DeepSeek-V2-Lite | `/home/zijie/models/DeepSeek-V2-Lite` |
+| Mixtral-8x7B-v0.1 | `/home/zijie/models/Mixtral-8x7B-v0.1` |
+| Qwen1.5-MoE-A2.7B | `/home/zijie/models/Qwen1.5-MoE-A2.7B` |
+| Qwen2-57B-A14B | `/home/zijie/models/Qwen2-57B-A14B` |
+
+## 测试设置
+
+| 项目 | 设置 |
+|---|---|
+| 执行方式 | 单 GPU 运行一个任务，在物理 GPU 1、2、3、4 上并行调度 |
+| 生成入口 | Hugging Face `generate()` 路径，`use_native_engine=False` |
+| 生成设置 | `do_sample=False`、`num_beams=1` |
+| 参数精度 | BF16，未量化 |
+| expert 计算位置 | GPU；按需或通过预取将参数从 CPU 内存搬至 GPU |
+| batch size | 1 |
+| 每请求长度 | 输入 512 token，生成 64 token |
+| 请求次数 | 1 次 warmup，随后 2 次正式测量 |
+| 主表统计范围 | 两次正式测量的 decode；排除 warmup 和 prefill |
+| 缓存策略 | managed LRU、resident LFU |
+| 缓存容量 | 4、8、16 GiB，按字节设置并读回校验 |
+| 专家预取 | 开启，prefill/decode 的预取 top-k 均取模型 routed top-k |
+| 其他设置 | 不启用 attention/KV offload 或自适应专家精度 |
+
+**容量口径：** 4/8/16 GiB 是共享驻留管理器（residency manager）的逻辑预算，包含它所管理的非路由参数，**不是纯 expert 缓存容量，也不是整张 GPU 的总显存硬上限**。底层设备池另外按构造比例 0.75 设置。因此，设置了某个管理器预算，并不意味着整个模型一定能在该 GPU 上运行。
+
+`use_native_engine=False` 只说明没有使用原生的生成循环；专家调度、缓存管理和参数搬运仍使用 C++ 实现，并不表示 expert 改为 CPU 计算。
+
+## 本次使用的缓存与预取机制
+
+### LRU 与 LFU
+
+- **LRU：** 在允许淘汰的驻留对象中，优先淘汰最久未访问的对象。
+- **LFU：** 在当前驻留周期内累计需求访问次数，优先淘汰次数最少的对象；频率相同时按较旧的需求访问序列、再按逻辑键确定顺序。需求命中和 miss 均计一次，预取不增加频率，真正淘汰后重新载入会重新计数。
+- 两者使用相同的管理器容量与准入路径；正在使用、被保护或尚未完成加载的对象还受生命周期约束。
+
+这里测试的是已实现的 resident LFU，不是此前的旧 LFU-like 策略。
+
+### 专家参数预取
+
+实验使用当前层路由信息预测下一层候选专家：
+
+```text
+当前层 router logits
+  → 按 token 求均值
+  → 选取 top-k 专家编号
+  → 提前搬运下一层相应 expert 参数
+  → 到达下一层后，仍按该层真实 gate 决定计算哪些 expert
+```
+
+它预测的是**需要搬运的参数**。没有提前读取下一层真实 gate，也没有用预测集合替代实际路由；不能将其称为论文 EAMC 的完整实现。
+
+对应原始配置：
+
+```python
+prefetch = True
+speculative_prefetch = True
+speculative_prefetch_overlap = True
+overlap_prefetch_policy = "off"
+```
+
+这里的 `speculative_prefetch` 是仓库中“预测式专家参数预取”的接口名称；`overlap_prefetch_policy="off"` 表示没有启用另一套重叠预算控制器，**不表示关闭专家预取**。
+
+实验脚本根据层调用的 token 行数显式绑定 PREFILL/DECODE 阶段。实验快照还包含预取目标层关联、纠错行为、并发加载生命周期及计数方面的本地改动，**不只是增加日志，也不是未经修改的上游行为**。
+
+## 命中率如何计算
+
+统计单位为一次层调用中一个去重的活跃 `(layer, expert)` 查找。对于本实验 batch=1 的 decode，每层的查找数等于该层 routed top-k。
+
+| 原生分类 | 含义 | 主指标归类 |
+|---|---|---|
+| `reuse_hit` | 复用已驻留的专家参数 | Hit |
+| `prefetch_ready_first_use` | 预取参数第一次被需要时已经就绪 | Hit |
+| `prefetch_late_first_use` | 预取已发起，但第一次被需要时尚未就绪 | Miss |
+| `demand_miss` | 到达时缺失，需要需求加载 | Miss |
+
+```text
+Hit = reuse_hit + prefetch_ready_first_use
+Miss = prefetch_late_first_use + demand_miss
+总查找 = Hit + Miss
+
+Hit rate = Hit / 总查找
+Miss rate = Miss / 总查找
+```
+
+先汇总两次正式测量的计数，再计算比例；以下百分比保留两位小数。参数显示在 CUDA 上，不代表异步搬运已经完成，因此 Python `is_tensor_on_device` 只用于交叉检查，不作为主命中计数。
+
+**最终状态：20 个配置完成全部请求，4 个配置因 CUDA OOM 未完成。** OOM 记为 N/A，而不是 0% 命中率。
 
 ## 4 GiB
 
@@ -47,17 +131,9 @@
 | Qwen1.5-MoE-A2.7B | 79.46% | 20.54% | 92.01% | 7.99% |
 | Qwen2-57B-A14B | N/A（OOM） | N/A（OOM） | N/A（OOM） | N/A（OOM） |
 
-## 如何理解结果
-
-**Mixtral 仍很低。** 所有成功配置的 decode `reuse_hit` 都为 0，主表约 0.7–0.8% 来自少量提前就绪的预取。当前预取未解决跨层循环淘汰：预取可以提前搬运，并不自动增加缓存可保留的工作集。
-
-**Qwen2-57B** 在 4 GiB 的两个策略均完成测量，但命中仅 8/28,224 ≈ 0.0283%；8/16 GiB 的两策略均 hash-proven OOM，0 个完整请求。这不意味着没有生成任何 token，也不意味着模型不支持。
-
-**不能从 cache hit 直接推出 TPS。** Late-prefetch 即便算 miss，仍可能提前做了一部分搬运；反之错误/未使用的预取会占带宽和缓存。此次只作缓存观测，不给出吞吐提升或精准 PCIe 流量节省的结论。
-
-当前使用现有普通预测路径：将**当前层** router logits 按 token 取均值、top-k 专家编号预测为**下一层**候选；不是下一层真实 gate、未来 oracle，也不冒称论文 EAMC。实际预测与下一层路由逐条关联，详见 `scientific-interpretation-notes.md`。
-
 ## 就绪、迟到、复用分解（decode）
+
+下表为两次正式测量的累计计数，可直接复算上述百分比。
 
 | 容量 GiB | 模型 | 策略 | 总查找 | 复用命中 | 就绪预取首次用 | 迟到预取首次用 | 到达缺失 |
 |---:|---|---|---:|---:|---:|---:|---:|
@@ -82,98 +158,120 @@
 | 16 | Qwen1.5-MoE-A2.7B | LRU | 12096 | 9595 | 17 | 61 | 2423 |
 | 16 | Qwen1.5-MoE-A2.7B | LFU | 12096 | 11124 | 6 | 13 | 953 |
 
-## 可比性限制
+## 结果解释
 
-- 新版本四模型 OFF/ON 64/8 短测均通过：8/8、4/4 配对，628 检查，输出及有序路由相同。
-- 完整矩阵每个成功配置内部三个请求的输出/有序路由均一致；但 **DeepSeek 16 GiB LRU ↔ LFU** 的 decode 路由不一致。DeepSeek LFU：4 ↔ 8 GiB 可比；凡涉及 16 GiB（4 ↔ 16、8 ↔ 16）均存在路由差异。上述差值不能严格归因于策略或容量，不作因果排名。
-- 其余成功容量内 LRU/LFU 配对通过 prompt、输出、有序路由、分母比对；结论仍仅限单个固定 prompt 的这个实验，不能泛化为整个数据集。
-- 旧 OFF 完整数据来自 native772，新 ON 来自 native2f，是历史参照而非完整同 binary A/B。旧 phase 编码 MIXED=2，新明确绑定 PREFILL/DECODE；原始 hash 不能不加区分地比较。
+### Mixtral：预取没有解决跨层循环淘汰
 
-## 故障、重跑与审计历史
+六个成功配置的 decode `reuse_hit` 都为 0，约 0.7–0.8% 的命中来自少量提前就绪的预取。与此前的跨层循环淘汰分析一致，这些配置没有形成可观测到的跨次需求复用。
 
-- DeepSeek 16-LFU 首次因 legacy H2D 转换计数遗漏一次 managed GPUFetch fallback，被旧校验拒绝。旧结果没有补成 PASS；只在新 frozen artifact 中把 legacy 视作 native 记录搬运账目的子集，重新跑完整 512/64/1+2。
-- DeepSeek 8-LFU 首次虽输出相同，但重复有序路由不同，独立验证拒绝；另跑完整请求，最终接受 attempt-2。
-- Qwen1.5 8-LFU 和 Mixtral 4-LFU 首次在原生 `wait_expert` 停滞，保存 SIGUSR1 栈与终止证据；重跑成功不代表首次成功，也不声称根因已修复。
-- Qwen1.5 4-GiB 两首次调度因 root 手动重跑与队列调度租约相撞，在加载模型前被拒绝，无数据；随后在 GPU2 串行完整重跑。
-- 所有实际产生的旧失败 raw/log/terminal 文件及 scheduler 外层日志均保留，`prior_attempts` 记录其路径；不得拿部分成功请求替代完整结果。Qwen1.5 4-GiB 两次加载前的租约拒绝未创建 raw、主 log 或 terminal，只由现存 scheduler 外层日志及 journal 的 returncode=75 证明，不存在的文件不是丢失的测量记录。
-- 六个明确 override 使用 harnessA512，其余使用856；AST/runner证明仅校验 legacy 子集和诊断变化，所有协议、观察器、主指标、路由、native 均不变。混合版本只按 cell hash 严格批准。
-- H2D 指标是 **native recorded 参数搬运账目**，不是独立 PCIe 带宽实测。legacy 子集与 native 账目不必相等；不据此宣称精确物理流量节省。
+预取改变的是参数搬运的时机，不会自动扩大可保留的工作集，也不会自动给各层分配受保护的缓存空间。因此，开启预取并不保证能够解决缓存循环淘汰。
 
-## 文件与复现
+### Qwen1.5：该请求下增加容量有明显收益
 
-- 最终逐配置 raw/GPU/store/版本/历史：`prefetch-manifest.executed.json`
-- 验证结果：`prefetch-validation.json`；汇总：`prefetch-summary.json`、`prefetch-summary.csv`
-- 原始结果、日志、终止 sidecar：`results/`、`logs/`
-- 校验变体证明：`harness-equivalence-evidence.json`；历史 OFF hash：`provenance/off-baseline-pins.json`
-- native源码变更说明：`prefetch-native-review-notes.md`；预取机制解读：`scientific-interpretation-notes.md`
-- 复现说明：`reproduce.md`
+在这次固定请求中，LRU 命中率从 28.21% 增至 79.46%，LFU 从 31.45% 增至 92.01%。成功配置的同容量策略配对通过了输入、输出、有序路由和分母比对；这不是对所有输入分布的普遍结论。
 
+### DeepSeek：记录结果，但不能忽略路由差异
 
-## 代码修改究竟是为了什么？
+表中可见较大容量下的命中率较高，但 16 GiB 的 LRU 与 LFU 存在 decode 路由差异；LFU 的 4/8 GiB 与 16 GiB 之间也存在路由差异。
 
-**确实修改过代码，也并非全部只是加日志。** 目的分为：模型适配、实现此前明确要求的真正 LFU、使已有普通专家预取按正确阶段/目标层运行、保护参数搬运与执行的并发安全，以及把命中和搬运账目统计准确。没有用新的缓存优化算法或更有利的实验设置替代原来的任务来“让结果好看”。
+因此，相关差值不能全部归因于缓存策略或容量，不据此对这些配置作严格的因果排名。
 
-### 按开发阶段区分
+### Qwen2-57B：低命中与 OOM 必须分开
 
-| 阶段 | 改动 | 目的与性质 |
-|---|---|---|
-| `96695c9 → f7f56df`：已经提交的测试基线 | Qwen2-MoE 适配；Mixtral runtime/checkpoint 名称匹配；DeepSeek 路径大小写与层编号；position IDs 设备对齐；CUDA 构建兼容 | 让四个既定模型能在当前依赖和设备上正确初始化、映射与执行；是模型/运行适配，不是新增缓存策略。 |
-| 同一已提交基线 | 路由 expert 与 generic 节点驻留键分离；多 victim 淘汰与 reservation 计账；`wait_expert` 期间释放 GIL | 修复假命中、空间不足和等待期间的并发问题；会影响真实执行，并不是纯日志。 |
-| `f7f56df → pre-prefetch 7c6284…`：此前已完成、仍未提交 | 真正 resident-cache LFU 以及 native 配置/读回 | 按用户要求替代旧 LFU-like：在当前驻留周期累计需求访问，命中和 miss 都计一次；预取不增频；真正淘汰清零；最少频率优先，平局按旧需求序列及 logical key。**这是新增策略实现**，已存在于本次预取测试之前。 |
-| 同一 LFU 阶段 | 忙/执行中/pending-dispatch 节点的淘汰资格检查；原子 eviction claim；事务 RAII 清理 | 防止还在使用的参数被搬回 CPU，或 admission/淘汰失败遗留状态。影响候选资格/生命周期，但不增加另一个“聪明”淘汰评分。 |
-| `7c6284… → final 286970…`：本次预取工作 | 显式 PREFILL/DECODE；正确关联目标层；删除重复预取/纠错时再发当前 miss | 让现有预测预取真正运行，并修复错层与重复发请求；属于**功能性 bugfix**。 |
-| 本次预取工作 | 传输唯一所有权；已驻留 no-op；持有状态直到 commit/release；失败回滚 | 防止 demand/prefetch 重复或冲突地搬同一个 expert，防止参数还没可用就被当作可消费；属于**并发安全修复**。 |
-| 本次预取工作 | native ready/late/reuse 分类、任务 issued/terminal 账目、取消任务扣账、事件与字节计数 | 使统计能完整收敛、能区分“参数显示 CUDA”和“使用时已经 ready”；主要是**观测与记账修复**，不是提高 hit 的算法。 |
-| 六个明确 fresh 重跑使用的 A512 artifact | legacy H2D 等于 native 的错误校验改为子集诊断 | legacy 只统计部分 ApplyPrecisionTarget 搬运，native 还记录 managed GPUFetch fallback，二者不应强求相等。只改变校验/诊断，主命中公式、协议、路由、生成及 native 均未变；旧失败没有被补写成成功。 |
+4 GiB 的两种策略都完成测量，但均仅命中 8/28,224 次，约 0.0283%。8/16 GiB 的四个配置由失败日志与终止记录确认为 OOM，没有完整完成请求；这不等于模型不支持，也不意味着运行中从未生成 token。
 
-### 三项功能性修复的直白解释
+### 命中率不等于吞吐率
 
-1. **让预取开关真正生效。** 直接 HF `generate` 原先可能处于默认 `MIXED` 阶段，而该普通预测路径会直接返回。测试 wrapper 把多 token dispatch 标为 prefill、单 token 标为 decode；两阶段 top-k 使用模型实际 routed top-k。这里不是更换预测器，而是接通已有路径。
-2. **修正“给哪一层预取”。** L−1 的预测应在真实走到 L 时与 L 的实际 expert 集合比较，而不是把当前层实际路由拿去纠正下一层。纠错现在只统计 TP/FP/FN，不拿真实路由做未来 oracle，也不把当前 miss 再重复发送为预取。
-3. **保证搬运/执行不打架。** 预取先拿到节点所有权，再申请缓存、H2D、提交和释放；同一个参数已有驻留时直接结束为 no-op，失败时回收状态。这会改变旧 bug 路径中的调度及淘汰时机，因此不能声称它对原先行为“完全没有影响”。
+迟到的预取虽然计入 Miss，仍可能已经完成一部分搬运；错误或未使用的预取则可能额外占用带宽和缓存。本报告不据此推导 token/s 提升或精确的 PCIe 流量节省。H2D 数字来自原生代码的参数搬运账目，不是独立硬件带宽测量。
 
-> 本轮保留既有 LRU/LFU 排序规则，不代表整个旧实现与修复后的实现行为完全等价。真实预取执行与安全资格检查的修复可能影响观测到的命中率，结果应归属于本文记录的**修改后本地版本**。
+## 验证与可比性边界
 
-### 没有采用哪些“让它通过”的手段
+- **5,008 项归档结果检查通过，0 FAIL、0 INCOMPLETE。** 这是配置、日志、计数和结果一致性等检查项，不是 5,008 次独立实验，也不等于 24 个配置全部推理成功。
+- 同一实验版本下，四模型进行过输入 64 / 输出 8 的短程 OFF/ON 检查：8 个任务、4 对配置、628 项检查通过，配对输出及有序路由相同。该短测不能替代完整容量/策略矩阵的 OFF/ON 对照。
+- 完整矩阵每个成功配置内部，三个请求的输出及有序路由一致。DeepSeek 16 GiB 的跨配置例外如上；其余成功的同容量 LRU/LFU 配对通过相应一致性检查。
+- 历史 OFF 完整表使用较早的 native772，本文 ON 表使用 native2f；两者不是完整同二进制的 A/B 实验，不能把差值全部解释为“只打开预取开关”的收益。
+- 全部结果只覆盖单个固定 prompt、batch=1 和指定长度，不能泛化为整个数据集或在线多请求服务。
+- 单元测试、短测及账目检查不能证明所有并发情形都安全，也不是与原版 Hugging Face 模型的完整数值一致性证明。
 
-- 没有新增或启用 ARC、论文 EAMC、历史路由优先级策略、按层固定配额或人为 pin 一组 expert 来改善主表。
-- 没有提前读取下一层真实 gate，或用测量后的真实路由反过来当未来预测。普通预测仍是**当前层 logits 均值 top-k 编号 → 下一层候选**，其预测质量本身并不保证好。
-- 没有主动修改模型真实 gate 数学/选 expert 实现，或用预测集合替代 `router_mask`。
-- 没有量化、切换模型、减少请求长度、缩小失败配置的 cache、改为 CPU expert 执行，或把同一个模型分到多卡以避开 OOM。
-- 没有把“预取正在做/迟到”计作 hit；没有把 OOM、停滞或部分请求的结果计作 0% 或完整成功。
-- 没有丢弃旧失败来覆盖历史；六个结果来自不同新进程的完整 `512/64/1+2` 重跑。
-- 没有声称已修复两次 `wait_expert` 停滞的根因。此次只保留证据并做有界 fresh 重试。
+## 失败与重跑记录
 
-### 验证能证明什么，不能证明什么
+历史失败未被成功重跑覆盖，原始数据、日志和终止记录按实际产生情况保留。
 
-- 36 个真实候选链接 C++ 测试、native 小 GPU 例子、四模型短程 OFF/ON 和最终 5,008 项结果校验支持实现与账目可靠；不是把阈值调低来掩盖少拷贝、漏任务或错误命中。
-- A512 的校验变化有逐函数 AST、runner diff 和 hash 证据，允许的两套 artifact 只按具体 cell 固定批准；实际 native 是同一个 `2f832c4…`。
-- **不是完整模型与原版 HF 的数值一致性证明。** 未主动修改 gate，也不等于每次异步执行的路由逐项相同：DeepSeek 16 GiB 的路由差异已观察到，仍必须披露。
-- 旧 OFF 完整表来自较早本地 native772；不能把新 ON 与旧 OFF 的差值直接写成“仅打开一个开关导致的纯收益”，更不能当作未经修改上游或论文完整复现成绩。
-
-### 审核代码的主要入口
-
-以下行号对应本次保存时工作区；它们是定位入口，之后编辑可能移动行号。
-
-| 目的 | 文件 / 入口 |
+| 配置或事件 | 处理与限制 |
 |---|---|
-| LFU 排序与安全候选 | [`core/prefetch/expert_residency.cpp`](../../core/prefetch/expert_residency.cpp)，`SelectVictim`（约 181–225 行） |
-| LFU 每次需求增频及 ready/late/reuse 分类 | 同文件 `RecordAccess`（约 797–868 行） |
-| LRU/LFU 真正配置及回读 | [`moe_infinity/runtime/model_offload.py`](../../moe_infinity/runtime/model_offload.py)，约 743–790 行 |
-| 预取传输所有权/失败回滚/no-op | [`core/prefetch/task_scheduler.cpp`](../../core/prefetch/task_scheduler.cpp)，`RunTrackedRoutedPrefetch`（约 31–136 行） |
-| 取消任务 terminal 扣账及计数聚合 | 同文件 `FetchExec`、`StartExec`、`TrackPrefetchTerminal`、`GetPrefetchPipelineStats` |
-| 当前层→下一层普通预测、目标层纠错 | [`moe_infinity/memory/expert_prefetcher.py`](../../moe_infinity/memory/expert_prefetcher.py)，约 436–580 行 |
-| 实际 expert dispatch 与纠错顺序 | [`moe_infinity/distributed/expert_executor.py`](../../moe_infinity/distributed/expert_executor.py)，约 480–568 行 |
-| HF 阶段绑定与完整实验协议 | [`benchmark_prefetch.frozen-856e4314.py`](../../.omx/research/moeinf-prefetch-matrix/benchmark_prefetch.frozen-856e4314.py)，`dispatch_with_phase` / `runtime_config` |
-| legacy 子集校验及 scoped 变体证明 | [`benchmark_prefetch.frozen-a512d061.py`](../../.omx/research/moeinf-prefetch-matrix/benchmark_prefetch.frozen-a512d061.py)、[`harness-equivalence-evidence.json`](../../.omx/research/moeinf-prefetch-matrix/harness-equivalence-evidence.json) |
+| DeepSeek 16 GiB LFU | 首次因旧 H2D 校验遗漏 managed GPUFetch fallback 被拒绝；将旧计数视为原生搬运账目的子集后，使用新脚本完整重跑，没有把旧结果直接改为 PASS。 |
+| DeepSeek 8 GiB LFU | 首次重复请求的有序路由不同，被拒绝；另跑完整请求，最终采用 attempt-2。 |
+| Qwen1.5 8 GiB LFU、Mixtral 4 GiB LFU | 首次在原生 `wait_expert` 停滞，保存栈和终止证据；重跑成功不代表停滞根因已经修复。 |
+| Qwen1.5 4 GiB 的两种策略 | 首次调度因任务租约冲突在加载前被拒绝；随后在 GPU2 串行完整重跑。加载前拒绝没有生成主 raw/log/terminal，只由调度日志和 returncode=75 证明。 |
+| Qwen2-57B 8/16 GiB 的两种策略 | 保留 OOM 分类，不用部分请求补成完整结果。 |
 
-## 最终版本与原始证据索引
+六个指定重跑采用 A512 冻结脚本，其余采用 856 版本。两者使用同一个 native 二进制；已归档的 AST/启动脚本比对将差异限定为旧 H2D 子集校验与诊断变化，主命中公式、请求协议和生成路径不变。每个配置采用哪个脚本，由最终清单记录。
 
-- Git HEAD：`f7f56df0cff8b5b609316dcd96be66443c07bab7`。
-- 实验源代码 patch SHA256：`2869700f303aba0d3c4ecbbfe85223e83bc6b0eabd060d516713964833660f06`（基线之后的 source/test diff）。
-- native `_store` SHA256：`2f832c4b51ecf2ad46cd2eef8b0f1323ba714c85e068e2eae4a1a34507419e57`。
-- 逐格模型路径、实际 GPU/store、版本及旧失败：[最终 executed manifest](../../.omx/research/moeinf-prefetch-matrix/prefetch-manifest.executed.json)。
-- [独立验证 5,008 项](../../.omx/research/moeinf-prefetch-matrix/prefetch-validation.json)、[精确汇总 JSON](../../.omx/research/moeinf-prefetch-matrix/prefetch-summary.json)、[CSV](../../.omx/research/moeinf-prefetch-matrix/prefetch-summary.csv)。
-- [完整复现说明](../../.omx/research/moeinf-prefetch-matrix/reproduce.md)、[实现/数据独立审计](../../.omx/research/moeinf-prefetch-matrix/final-audit.md)。
+## TODO：低命中率问题与更大显存 GPU 验证
 
-**本次保存文档没有重新运行实验，也没有再改源代码、stage 或 commit。** 结果表是已验证结果的归档，不是重新生成或调高的成绩。
+以下是后续研究与实验清单，**尚未执行，也不表示已经实现新的缓存策略**。更换设备后应建立新的结果目录和版本记录，不覆盖本文历史数据。
+
+### 待验证的问题
+
+**核心假设：参数会重复使用，但在跨层遍历后再次被需要之前，已经被缓存淘汰。** prefill 结束后缓存偏向后几层，随后从前几层开始 decode；之后每个 token 又依次遍历各层，可能持续出现循环淘汰。增加 warmup 不一定能消除这种容量与复用间隔不匹配。
+
+按本地 BF16 权重尺寸，仅计算 routed expert 参数：
+
+| 模型 | MoE 层数 × routed top-k | 单个 expert | 一个 decode token 涉及的 routed 参数工作集 | 乐观容量对照 |
+|---|---:|---:|---:|---|
+| Mixtral-8x7B-v0.1 | 32 × 2 | 336 MiB | 21 GiB，64 个层—expert 对象 | 4/8/16 GiB 最多放 12/24/48 个 |
+| Qwen2-57B-A14B | 28 × 8 | 52.5 MiB | 11.484375 GiB，224 个对象 | 4 GiB 最多放 78 个 |
+| Qwen1.5-MoE-A2.7B | 24 × 4 | 16.5 MiB | 1.546875 GiB，96 个对象 | 4 GiB 最多放 248 个 |
+| DeepSeek-V2-Lite | 26 × 6 | 16.5 MiB | 2.513671875 GiB，156 个对象 | 4 GiB 最多放 248 个 |
+
+尺寸依据见[本地权重预检记录](../../.omx/research/moeinf-four-models/results/preflight-patched.json)。不同层的同编号 expert 是不同参数对象；“工作集”不是实测每 token 的 H2D 流量。这些换算不包含其他参数、KV cache、激活、临时工作区和分配器开销，实际共享预算还会被非路由对象占用。
+
+对于 Mixtral，同一 expert 在相邻 decode token 间复用，结构上至少跨过其他 31 层的 62 个不同 expert；16 GiB 理想情况下只能容纳 48 个。Qwen2-57B 对应至少跨过 216 个，4 GiB 最多容纳 78 个。这支持普通 LRU 的循环淘汰解释，但不是任意缓存策略都必然零命中的证明，也不是已经逐事件测得的精确复用距离。
+
+- [ ] **直接验证循环淘汰。** 记录按 token/层排列的实际 expert 请求、命中类型、准入、淘汰对象及原因、每层驻留量，重建复用距离和相应参数字节量。观察是否确实在再次使用前被后续层挤出，而不是仅凭模型总大小推断。旧 OFF 的快照与结构分析见[零命中审查](../../.omx/research/moeinf-capacity-sweep/mixtral-zero-audit.json)，不能把它当成本次 ON 的逐事件轨迹。
+- [ ] **验证 resident LFU 的频率积累限制。** 分别统计需求访问频率分布、驻留时长、淘汰后重新计数的次数，以及同频平局的淘汰决定。旧 OFF 的测量结束快照中，Mixtral 驻留对象频率均为 1，支持“第二次访问前已淘汰”的解释；需要在新版本、新容量下重新验证，不能预设所有 LFU 都无效。
+- [ ] **分开分析预测失误与预取迟到。** 同时记录下一层预测集合与实际集合的交集、预取发起/完成及需求到达时序、ready/late/reuse/demand-miss、未使用预取被淘汰的数量及搬运账目。判断低命中来自预测不准、提前量不足还是已预取参数再次被挤出，不把“发起预取”当作“命中”。
+- [ ] **区分两个千问模型。** Qwen2-57B 的 4 GiB 是极低命中，而 8/16 GiB 是 OOM；Qwen1.5 在较大容量已有明显命中，不能合并成“千问整体零命中”。对 OOM 单独记录失败阶段和显存占用，不填入 0% 命中率。
+
+### 更大显存 GPU 上的实验计划
+
+- [ ] **先建立可复现的新测试基线。** 当前 Python 接口与历史冻结脚本不完全兼容；启动前核对或适配观测接口，验证策略读回、阶段划分和命中计数，再冻结源码、native 二进制与测试脚本。不能只更换 GPU 就将历史脚本视为可直接运行，也不能把新结果标成历史版本的复测。
+- [ ] **先确认设备和显存预算，再确定容量矩阵。** 记录 GPU 型号/显存、CPU—GPU 连接、驱动、软件及 native 版本；检查管理器预算、构造设备池、非路由参数、KV/激活/工作区和峰值显存。21 GiB、11.48 GiB 是单 token 的 routed 参数工作集估算，**不是总显存最低要求，也不保证超过后就高命中**；不同 token 的路由可能变化，长期工作集可能更大。
+- [ ] **优先扫描 Mixtral、Qwen2-57B 的容量转折区间。** 在显存允许的前提下，Mixtral 可考虑 4/8/16/20/24/32 GiB；Qwen2-57B 可考虑 4/8/12/16/24 GiB。它们是候选管理器预算，最终档位需根据真实显存余量确定。先复测原有可运行档位，再观察跨越上述工作集附近时 `reuse_hit` 是否上升；不要直接假定某档足够。
+- [ ] **建立同设备、同版本的 LRU/LFU × 预取 OFF/ON 对照。** 在新 GPU 上重新跑小容量基线，固定模型、精度、请求、代码、二进制及统计口径；不能将新 GPU 的 ON 与旧 GPU 的历史 OFF 差值解释为单独的预取收益。每张 GPU 同时只运行一个任务，使用哪些卡及最终测试范围在实际启动前确认。
+- [ ] **先沿用当前协议，再扩展负载。** 第一阶段保持 batch=1、512 输入/64 输出、1 warmup + 2 次测量；优先解决两大模型的问题，再以 Qwen1.5 和 DeepSeek 作为对照。第二阶段增加 prompt 类型、重复次数及 decode 长度，区分冷启动与稳态复用，仍将 prefill/decode 分开报告。
+- [ ] **校验路由与结果可比性。** 保存输入/输出和有序路由指纹；跨策略或容量出现路由差异时，单独披露，不把命中率差值全部归因于缓存。必要时用同一冻结路由轨迹做离线策略对照，并明确它不替代真实模型运行。
+- [ ] **输出容量曲线和逐层分解。** 主要报告 decode Hit/Miss、四类到达计数、每层驻留量、需求及预取搬运账目、未使用预取淘汰量和 OOM/停滞状态。保存全部失败及重跑记录，不能只展示最终成功配置；增加容量后是否仍有循环淘汰，应由这些记录共同判断。
+
+### 容量仍不足时的备选研究方向
+
+- [ ] 在完成上述基线验证后，单独设计按层配额、保护部分层/高复用 expert、流式处理其他 expert 或准入旁路的对照，检查是否能避免全局缓存被逐层扫描冲刷。
+- [ ] 如研究跨淘汰保留频率历史或带衰减的频率策略，应明确将其标为新的策略变体，不与当前 resident LFU 混称；新策略与基线保持相同预算，并同时评估路由正确性和预取浪费。
+
+研究动机可用一个理想例子说明：循环访问 A→B→C→D，而缓存只有三个槽，LRU 在稳态可能每次都 miss；若保护 A、B，让 C、D 共用第三槽，稳态可有 50% 命中。**这是解释机制的示例，不是四个模型的已测优化收益。**
+
+## 实验版本与原始证据
+
+### 版本标识
+
+| 项目 | 标识 |
+|---|---|
+| 实验时 Git 基线 | `f7f56df0cff8b5b609316dcd96be66443c07bab7` |
+| 实验源码补丁 SHA256 | `2869700f303aba0d3c4ecbbfe85223e83bc6b0eabd060d516713964833660f06` |
+| 原生 `_store` SHA256 | `2f832c4b51ecf2ad46cd2eef8b0f1323ba714c85e068e2eae4a1a34507419e57` |
+| 主要冻结脚本 | `benchmark_prefetch.frozen-856e4314.py` |
+| 六个指定重跑脚本 | `benchmark_prefetch.frozen-a512d061.py` |
+
+这些标识描述**当时实际测量的版本**，不是用当前提交号替换历史版本。复现这些历史数字需要相应源码快照、native 二进制、冻结脚本及模型输入；用当前代码重新测试应另外记录版本和结果。
+
+### 本机归档索引
+
+以下证据位于本机 `.omx/research/moeinf-prefetch-matrix/`。该目录不随 Git 提交分发，单独克隆仓库不会自动获得这些原始文件。
+
+- [最终逐配置清单](../../.omx/research/moeinf-prefetch-matrix/prefetch-manifest.executed.json)：模型路径、GPU、容量、策略、脚本版本及历史尝试。
+- [结果检查](../../.omx/research/moeinf-prefetch-matrix/prefetch-validation.json)、[汇总 JSON](../../.omx/research/moeinf-prefetch-matrix/prefetch-summary.json)、[汇总 CSV](../../.omx/research/moeinf-prefetch-matrix/prefetch-summary.csv)。
+- [原始结果目录](../../.omx/research/moeinf-prefetch-matrix/results/)、[日志目录](../../.omx/research/moeinf-prefetch-matrix/logs/)。
+- [主要冻结脚本](../../.omx/research/moeinf-prefetch-matrix/benchmark_prefetch.frozen-856e4314.py)、[重跑冻结脚本](../../.omx/research/moeinf-prefetch-matrix/benchmark_prefetch.frozen-a512d061.py)、[脚本差异证据](../../.omx/research/moeinf-prefetch-matrix/harness-equivalence-evidence.json)。
+- [普通专家预取机制说明](../../.omx/research/moeinf-prefetch-matrix/scientific-interpretation-notes.md)、[历史复现说明](../../.omx/research/moeinf-prefetch-matrix/reproduce.md)、[历史 OFF 版本记录](../../.omx/research/moeinf-prefetch-matrix/provenance/off-baseline-pins.json)。
+
+**本次报告修订不改变三张主表、20 行计数分解、失败分类或原始实验文件；没有重新运行模型，也没有修改实现代码。**
